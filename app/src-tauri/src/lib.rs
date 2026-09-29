@@ -516,6 +516,16 @@ pub fn run() {
                     "main" if window.app_handle().state::<Runtime>().is_debug() && !tray::available() => window.app_handle().exit(0),
                     // Closing a prompt is "not now": it comes back if still due.
                     "prompt" => ui::dismiss(window.app_handle()),
+                    // Closing the workout monitor mid-set means stop: release the
+                    // camera instead of counting reps nobody can see.
+                    "gym" => {
+                        let life = window.app_handle().state::<Lifecycle>();
+                        if life.snapshot().phase == Phase::WorkoutActive {
+                            println!("[STATE] workout window closed — cancelled, camera released");
+                            life.cancel();
+                        }
+                        let _ = window.hide();
+                    }
                     _ => { let _ = window.hide(); }
                 }
             }

@@ -47,7 +47,14 @@ struct Gate {
     preview: bool,
     /// When the tick loop first saw the set complete (the "LOGGED" beat).
     unlocked_since: Option<f64>,
+    /// The active set's last progress value and when it last changed.
+    progress_since: Option<(Option<f64>, f64)>,
 }
+
+/// A set nobody is doing (window closed, terminal gone) must not hold the
+/// camera forever.
+// ponytail: fixed 10 min; make it a setting if sets legitimately idle longer.
+pub const ABANDON_AFTER: f64 = 600.;
 
 /// What the tick loop works out before each tick.
 #[derive(Default)]
@@ -301,11 +308,33 @@ impl Lifecycle {
                 core.session.configure_timer(minutes, now);
             }
         }
+        if !self.debug && self.abandoned(&core, now) {
+            facts.extend(core.session.release(Release::Cancel, now));
+            let minutes = work_minutes(&core);
+            core.session.configure_timer(minutes, now);
+            println!("[STATE] abandoned — no progress for {} min, camera released", ABANDON_AFTER as u32 / 60);
+        }
         // Most ticks change nothing durable: only the countdown moves.
         let snapshot = if facts.is_empty() { core.session.snapshot(now) } else { self.apply(&mut core, now, false, &facts) };
         drop(core);
         self.effects.snapshot(&snapshot);
         (snapshot, locked)
+    }
+
+    /// True once an active set has shown no new progress for ABANDON_AFTER.
+    fn abandoned(&self, core: &Core, now: f64) -> bool {
+        let snapshot = core.session.snapshot(now);
+        let mut gate = self.gate.lock().unwrap();
+        if snapshot.phase != Phase::WorkoutActive {
+            gate.progress_since = None;
+            return false;
+        }
+        let value = snapshot.progress.as_ref().map(|p| p.value);
+        let (last, since) = gate.progress_since.get_or_insert((value, now));
+        if *last != value { *last = value; *since = now; }
+        let over = now - *since >= ABANDON_AFTER;
+        if over { gate.progress_since = None; }
+        over
     }
 
     /// Start the set that is owed: the one the lock prescribed, or — early,
@@ -1299,5 +1328,30 @@ mod tests {
         assert_eq!(workout.life.debug_start(None).unwrap_err(), "Manual testing requires Debug mode");
         assert_eq!(workout.life.debug_stop().unwrap_err(), "Manual testing requires Debug mode");
         assert_eq!(workout.life.debug_progress(None, true).unwrap_err(), "Manual testing requires Debug mode");
+    }
+
+    #[test]
+    fn a_set_without_progress_for_ten_minutes_is_abandoned_and_releases_the_camera() {
+        let rig = rig(LIFTS, Some(FakeHub::new(vec![])), false);
+        lock(&rig);
+        start(&rig);
+        tick(&rig, 0.0, reminding()); // the loop sees the set start
+        // new progress restarts the wait
+        tick(&rig, ABANDON_AFTER - 1.0, reminding());
+        rig.life.progress(frame(session(&rig), 1.0, "reps", false));
+        assert_eq!(tick(&rig, 2.0, reminding()).0.phase, Phase::WorkoutActive);
+        assert_eq!(tick(&rig, ABANDON_AFTER - 1.0, reminding()).0.phase, Phase::WorkoutActive);
+        let (snapshot, _) = tick(&rig, 1.0, reminding());
+        assert_eq!((snapshot.phase, snapshot.remaining_seconds), (Phase::Coding, 1500.0));
+        assert!(rig.wire().iter().any(|(event_type, _)| event_type == "desktop_unlocked"));
+        assert_eq!(rig.types().iter().filter(|event_type| *event_type == "detector_stopped").count(), 1);
+    }
+
+    #[test]
+    fn debug_sets_are_never_abandoned() {
+        let rig = rig(LIFTS, Some(FakeHub::new(vec![])), true);
+        let squat = detector::debug_exercise_options().unwrap().into_iter().find(|rx| rx.exercise == "squat");
+        rig.life.debug_start(squat).unwrap();
+        assert_eq!(tick(&rig, ABANDON_AFTER * 2.0, reminding()).0.phase, Phase::WorkoutActive);
     }
 }

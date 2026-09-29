@@ -18,6 +18,10 @@ plugged back in), and `rfp finish --honor` works either way. Debug mode offers m
 `rfp start` begins the next set early, without waiting for the timer. Once the
 day's plan is complete it reports an error instead, because nothing is owed.
 
+A workout never holds the camera without an owner. Closing the workout monitor
+during a set cancels it, and a set with no progress for 10 minutes is abandoned.
+Either way you go back to coding and the camera is released.
+
 Emergency release: `rfp cancel` stops the current workout without completion
 credit. Cancel, snooze and skip are recorded in history as an unlock with the
 reason, so every lock has a matching unlock.
