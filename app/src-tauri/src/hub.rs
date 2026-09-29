@@ -540,7 +540,7 @@ pub fn start(app: AppHandle) {
 /// Print a terminal line when the camera gains/loses your pose (deduped — no
 /// per-frame angle spam), so you can tell from the terminal whether you're in
 /// frame while a set runs.
-fn print_detect(data: &serde_json::Value) {
+fn print_detect(app: &AppHandle, data: &serde_json::Value) {
     static LAST: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
     let pose = data.get("poseDetected").and_then(|v| v.as_bool()).unwrap_or(false);
     if let Ok(mut last) = LAST.lock() {
@@ -554,6 +554,7 @@ fn print_detect(data: &serde_json::Value) {
                 }
             );
             *last = Some(pose);
+            let _ = app.emit("vision-pose", serde_json::json!({"detected": pose}));
         }
     }
 }
@@ -569,7 +570,7 @@ fn pump_events(app: AppHandle, rx: std::sync::mpsc::Receiver<VisionEvent>) {
                     let _ = app.emit_to("main", "vision-camera", serde_json::json!({"cameraId": camera_id, "data": data}));
                 }
             }
-            VisionEvent::Landmarks(data) => print_detect(&data),
+            VisionEvent::Landmarks(data) => print_detect(&app, &data),
             VisionEvent::Progress { value, unit, satisfied, context } => {
                 if !DETECTOR_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) || crate::control::preview_only(&app) { continue; }
                 if !context.belongs_to(WORKOUT_METRIC, session_id().as_deref()) {

@@ -21,6 +21,55 @@ fn view(app:&AppHandle,name:&str,preview:bool){
 }
 fn stop_preview(app:&AppHandle){if preview_only(app){crate::hub::disable_metric_now(app);}view(app,"screen",false);}
 fn show(app:&AppHandle){if let Some(w)=app.get_webview_window("main"){let _=w.show();let _=w.unminimize();}}
+/// `--all`: nothing left running. Previews, fixture video and the camera stop;
+/// windows hide unless lock mode must keep them up.
+fn close_all(app:&AppHandle){
+ stop_preview(app);crate::stop_debug_process(app);crate::hub::disable_metric_now(app);
+ if !app.state::<Runtime>().enforces_windows(){for w in app.webview_windows().values(){let _=w.hide();}}
+}
+/// Put a debug set into a detection state. Anything but `live` turns the camera
+/// off so only the simulated state (and step/done/next) drives the UI.
+fn detection_state(app:&AppHandle,state:&str){
+ if state=="live"{return;}
+ crate::hub::disable_metric_now(app);
+ match state{
+  "no-pose"=>{println!("[DETECT] 🔴 no pose in frame (simulated)");let _=app.emit("vision-pose",serde_json::json!({"detected":false}));},
+  "vision-down"=>{let _=app.emit("vision-fallback",serde_json::json!({"reason":"debug: simulated vision failure"}));},
+  _=>{},
+ }
+}
+/// `rfp debug next`: advance exactly one phase using the same engine transitions
+/// the timer, detector and weight entry use.
+fn advance(app:&AppHandle,weight:Option<f64>)->Result<(),String>{
+ let (now,today)=(SystemClock.now(),SystemClock.today());
+ let state=app.state::<SharedCore>();
+ let before=state.lock().unwrap().session.snapshot(now);
+ match before.phase{
+  Phase::Coding|Phase::ExerciseRequired|Phase::Unlocked=>{
+   let mut core=state.lock().unwrap();
+   match before.phase{
+    Phase::Coding=>{core.session.configure_timer(0.,now);core.session.tick(now,&today);},
+    Phase::ExerciseRequired=>core.session.begin_workout(),
+    _=>{core.session.resume_coding(now);let minutes=core.store.setting("work_minutes","25").parse().unwrap_or(25.);core.session.configure_timer(minutes,now);},
+   }
+   let snap=crate::persist_and_snapshot(&mut core);drop(core);
+   if snap.phase==before.phase{return Err(format!("Cannot advance from {:?}; nothing to prescribe",before.phase));}
+   if snap.phase==Phase::WorkoutActive{crate::enable_metric_for(app,&snap);}
+   if snap.phase==Phase::Coding{crate::hub::disable_metric_async(app);}
+   crate::emit_snapshot(app,&snap);
+   if snap.phase!=Phase::Coding{show(app);}
+  },
+  Phase::WorkoutActive=>{
+   let rx=before.prescription.ok_or("Active set has no prescription")?;
+   crate::simulate_progress(app.clone(),state,if rx.target_seconds>0.{rx.target_seconds}else{rx.target_reps as f64},true)?;
+  },
+  Phase::WeightConfirmation=>{
+   let default=before.prescription.map(|rx|rx.default_weight).unwrap_or(0.);
+   crate::confirm_weight(app.clone(),state,weight.unwrap_or(default));
+  },
+ }
+ Ok(())
+}
 fn dispatch(app:&AppHandle, command:Command)->Result<serde_json::Value,String>{
  command.validate()?;
 
@@ -71,14 +120,24 @@ fn dispatch(app:&AppHandle, command:Command)->Result<serde_json::Value,String>{
     },_=>unreachable!()
    }
   },
-  Command::Debug{operation,exercise,value,video}=>{
+  Command::Debug{operation,exercise,value,video,state,reps,seconds,weight,all}=>{
    app.state::<Runtime>().require_debug()?;
    match operation.as_str(){
     "history"=>{let state=app.state::<SharedCore>();let core=state.lock().unwrap();return Ok(serde_json::json!({"source":"debug","records":core.store.records(None,None,0,100,false).map_err(|e|e.to_string())?}));},
     "exercises"=>return serde_json::to_value(crate::debug_exercises(app.clone())?).map_err(|e|e.to_string()),
     "videos"=>return serde_json::to_value(crate::debug_videos(app.clone())?).map_err(|e|e.to_string()),
-    "start"=>{stop_preview(app);crate::debug_mode(app.clone(),app.state::<SharedCore>(),"workout".into(),exercise)?;show(app);},
-    "stop"=>{stop_preview(app);crate::debug_mode(app.clone(),app.state::<SharedCore>(),"coding".into(),None)?;},
+    "start"=>{
+     if (reps.is_some()||seconds.is_some()||weight.is_some())&&exercise.is_none(){return Err("Programming a set needs --exercise NAME".into());}
+     stop_preview(app);
+     crate::debug_program(app.clone(),app.state::<SharedCore>(),"workout".into(),exercise,|rx|{
+      if let Some(n)=reps{rx.kind=engine::types::ExerciseKind::Rep;rx.target_reps=n;rx.target_seconds=0.;}
+      if let Some(n)=seconds{rx.kind=engine::types::ExerciseKind::Continuous;rx.target_seconds=n;rx.target_reps=0;}
+      if let Some(n)=weight{rx.default_weight=n;}
+     })?;
+     detection_state(app,state.as_deref().unwrap_or("live"));show(app);
+    },
+    "stop"=>{stop_preview(app);crate::debug_mode(app.clone(),app.state::<SharedCore>(),"coding".into(),None)?;if all{close_all(app);}},
+    "next"=>{stop_preview(app);advance(app,weight)?;},
     "step"|"done"=>{
      let snap=app.state::<SharedCore>().lock().unwrap().session.snapshot(SystemClock.now());
      if snap.phase!=Phase::WorkoutActive{return Err("Start a debug workout first".into());}
@@ -99,7 +158,7 @@ fn dispatch(app:&AppHandle, command:Command)->Result<serde_json::Value,String>{
   Command::Start=>{stop_preview(app);daily::reminder_action(app.clone(),"start".into(),None)?;if let Some(w)=app.get_webview_window("main"){let _=w.show();let _=w.unminimize();}},
   Command::Snooze{minutes}=>daily::reminder_action(app.clone(),"snooze".into(),Some(minutes))?,
   Command::Skip=>daily::reminder_action(app.clone(),"skip".into(),None)?,
-  Command::Cancel=>{stop_preview(app);crate::stop_debug_process(app);crate::emergency_escape(app.clone(),app.state::<SharedCore>());},
+  Command::Cancel{all}=>{stop_preview(app);crate::stop_debug_process(app);crate::emergency_escape(app.clone(),app.state::<SharedCore>());if all{close_all(app);}},
   Command::Finish{weight,honor}=>{
    let phase=app.state::<SharedCore>().lock().unwrap().session.snapshot(SystemClock.now()).phase;
    if !matches!(phase,Phase::WorkoutActive|Phase::WeightConfirmation){return Err("No active workout to finish. Run: reps start".into());}

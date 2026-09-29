@@ -41,7 +41,7 @@ function WeightEntry({ initial }: { initial: number }) {
  return <><span className="medium">Set complete</span><WorkoutControl initial={initial}/></>;
 }
 
-function PrimaryStatus({ snapshot, fallback, debug }: { snapshot: Snapshot; fallback: boolean; debug: boolean }) {
+function PrimaryStatus({ snapshot, fallback, debug, pose }: { snapshot: Snapshot; fallback: boolean; debug: boolean; pose: boolean | null }) {
   switch (snapshot.phase) {
     case "CODING":
       return <><span className="small">{debug ? "Idle · start a test when you’re ready" : `Next workout in ${mmss(snapshot.remainingSeconds)}`}</span>{!debug&&!snapshot.day?.complete&&<WorkoutControl/>}</>;
@@ -65,6 +65,7 @@ function PrimaryStatus({ snapshot, fallback, debug }: { snapshot: Snapshot; fall
             <span className="small">{debt === 1 ? "set" : "sets"} left today</span>
             <span className="small">Including this set · {snapshot.day!.setsDone} of {snapshot.day!.setsTotal} complete</span>
           </div>}
+          {!fallback && pose !== null && <span className="small">{pose ? "● In frame · tracking" : "○ Not in frame · step back so your whole body is visible"}</span>}
           <span className="small">{fallback ? "Camera down · finish via rfp finish --honor" : debug ? "Test progress · not saved to your workouts" : "A little movement between prompts"}</span>
         </>
       );
@@ -109,13 +110,16 @@ export function Screen({ snapshot, variant, debug = false }: { snapshot: Snapsho
   const coding = snapshot.phase === "CODING";
   const mode = coding ? "code" : "workout";
   const [fallback, setFallback] = useState(false);
+  const [pose, setPose] = useState<boolean | null>(null);
   useEffect(() => {
-    if (coding) setFallback(false);
+    if (coding) { setFallback(false); setPose(null); }
   }, [coding]);
   useEffect(() => {
     let active=true;let remove:(()=>void)|undefined;
+    let removePose:(()=>void)|undefined;
     void listen<{reason:string}>("vision-fallback",()=>{if(active)setFallback(true);}).then(fn=>{if(active)remove=fn;else fn();});
-    return()=>{active=false;remove?.();};
+    void listen<{detected:boolean}>("vision-pose",({payload})=>{if(active)setPose(payload.detected);}).then(fn=>{if(active)removePose=fn;else fn();});
+    return()=>{active=false;remove?.();removePose?.();};
   },[]);
 
   // Set logged → whole-screen takeover for the beat before CODE.
@@ -148,7 +152,7 @@ export function Screen({ snapshot, variant, debug = false }: { snapshot: Snapsho
       <h1 className="title">{debug ? (coding ? "DEBUG" : "TEST WORKOUT") : (coding ? "CODE" : "WORKOUT")}</h1>
       <div className="character" />
       <div className="status">
-        {variant === "gym" ? <GymStatus snapshot={snapshot} debug={debug} /> : <PrimaryStatus snapshot={snapshot} fallback={fallback} debug={debug} />}
+        {variant === "gym" ? <GymStatus snapshot={snapshot} debug={debug} /> : <PrimaryStatus snapshot={snapshot} fallback={fallback} debug={debug} pose={pose} />}
       </div>
     </div>
   );
