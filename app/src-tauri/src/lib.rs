@@ -254,15 +254,26 @@ fn shutdown_runtime(app: &AppHandle) {
 #[tauri::command]
 fn emergency_escape(app: AppHandle, state: State<SharedCore>) -> Snapshot {
     let mut core = state.lock().unwrap();
-    core.session.debug_force_coding(SystemClock.now());
-    let minutes = core.store.setting("work_minutes", "25").parse().unwrap_or(25.);
-    core.session.configure_timer(minutes, SystemClock.now());
-    let snap = persist_and_snapshot(&mut core);
+    let snap = force_coding(&mut core, SystemClock.now());
     drop(core);
     hub::disable_metric_async(&app);
     emit_snapshot(&app, &snap);
     snap
 }
+
+/// Back to CODE with a fresh timer. The caller releases the camera.
+fn force_coding(core: &mut Core, now: f64) -> Snapshot {
+    core.session.debug_force_coding(now);
+    let minutes = core.store.setting("work_minutes", "25").parse().unwrap_or(25.);
+    core.session.configure_timer(minutes, now);
+    persist_and_snapshot(core)
+}
+
+/// A workout nobody is doing (window closed, terminal gone) must not hold the
+/// camera forever.
+// ponytail: fixed 10 min; make it a setting if sets legitimately idle longer.
+const ABANDON_AFTER: f64 = 600.;
+fn abandoned(last_change: f64, now: f64) -> bool { now - last_change >= ABANDON_AFTER }
 
 /// F11 in the gym window: flip it between maximized and fullscreen.
 #[tauri::command]
@@ -695,8 +706,18 @@ pub fn run() {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
                     api.prevent_close();
-                    if window.app_handle().state::<Runtime>().is_debug() { window.app_handle().exit(0); }
-                    else { let _ = window.hide(); }
+                    let app = window.app_handle();
+                    if app.state::<Runtime>().is_debug() { app.exit(0); }
+                    else {
+                        // Closing the workout display means stop: release the camera
+                        // instead of counting reps nobody can see.
+                        let active = app.state::<SharedCore>().lock().unwrap().session.snapshot(SystemClock.now()).phase == Phase::WorkoutActive;
+                        if active && !app.state::<Runtime>().enforces_windows() {
+                            println!("[STATE] workout window closed — cancelled, camera released");
+                            emergency_escape(app.clone(), app.state::<SharedCore>());
+                        }
+                        let _ = window.hide();
+                    }
                 } else if window.app_handle().state::<Runtime>().is_debug() {
                     api.prevent_close();
                     let _ = window.hide();
@@ -735,6 +756,7 @@ pub fn run() {
             }
             std::thread::spawn(move || {
                 let mut unlocked_since: Option<f64> = None;
+                let mut active_since: Option<(Option<f64>, f64)> = None;
                 let mut previous = SystemClock.now();
                 let mut last_poll = 0.;
                 loop {
@@ -807,6 +829,21 @@ pub fn run() {
                     } else {
                         unlocked_since = None;
                     }
+                    // Lock mode is exempt: waiting it out would be an unlock bypass.
+                    if snap.phase == Phase::WorkoutActive && !handle.state::<Runtime>().enforces_windows() {
+                        let progress = snap.progress.as_ref().map(|p| p.value);
+                        let (value, since) = active_since.get_or_insert((progress, now));
+                        if *value != progress { *value = progress; *since = now; }
+                        if abandoned(*since, now) {
+                            snap = force_coding(&mut core, now);
+                            active_since = None;
+                            hub::disable_metric_async(&handle);
+                            println!("[STATE] abandoned — no progress for {} min, camera released", ABANDON_AFTER as u32 / 60);
+                            daily::notify("Workout abandoned after 10 minutes without progress; camera released. Start again with: rfp start".into());
+                        }
+                    } else {
+                        active_since = None;
+                    }
                     let presence = handle.state::<daily::SharedDaily>().lock().unwrap().agents.clone();
                     let runtime_status = serde_json::json!({"pid":std::process::id(),"updatedAt":now,"agents":presence,"phase":snap.phase,"remainingSeconds":snap.remaining_seconds,"mode":handle.state::<Runtime>().mode,"lockMode":handle.state::<Runtime>().enforces_windows()});
                     let status_home = &handle.state::<Runtime>().session_home;
@@ -834,6 +871,11 @@ pub fn run() {
 #[cfg(test)]
 mod debug_view_tests {
     use super::*;
+    #[test]
+    fn a_workout_without_progress_is_abandoned_after_ten_minutes() {
+        assert!(!abandoned(1000., 1000. + ABANDON_AFTER - 1.));
+        assert!(abandoned(1000., 1000. + ABANDON_AFTER));
+    }
     #[test]
     fn selectable_exercises_cover_every_shipped_detector_with_correct_units() {
         let options = debug_exercise_options().unwrap();
