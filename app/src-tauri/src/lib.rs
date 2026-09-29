@@ -301,11 +301,18 @@ fn debug_exercises(app: AppHandle) -> Result<Vec<Prescription>, String> {
 /// detection on demand from the debug toggle.
 #[tauri::command]
 fn debug_mode(app: AppHandle, state: State<SharedCore>, mode: String, exercise: Option<String>) -> Result<Snapshot, String> {
+    debug_program(app, state, mode, exercise, |_| {})
+}
+
+/// `debug_mode` with a hook to reprogram the chosen exercise's target (CLI
+/// `--reps/--seconds/--weight`).
+pub(crate) fn debug_program(app: AppHandle, state: State<SharedCore>, mode: String, exercise: Option<String>, program: impl FnOnce(&mut Prescription)) -> Result<Snapshot, String> {
     app.state::<Runtime>().require_debug()?;
     if mode != "workout" && mode != "coding" { return Err("Unknown test action".into()); }
     let selected = if mode == "workout" {
         exercise.map(|name| debug_exercise_options()?.into_iter().find(|rx| rx.exercise == name)
             .ok_or_else(|| format!("Unknown exercise: {name}"))).transpose()?
+            .map(|mut rx| { program(&mut rx); rx })
     } else { None };
     stop_debug_process(&app);
     hub::disable_metric_now(&app);

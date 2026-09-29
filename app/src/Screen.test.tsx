@@ -96,3 +96,15 @@ it("keeps gym screens and completed routines free of start controls",()=>{
  rerender(<Screen snapshot={{...base,day:{...base.day!,complete:true}}} variant="primary"/>);
  expect(screen.queryByRole('button')).not.toBeInTheDocument();
 });
+it("shows whether the detector sees a pose during an active set",async()=>{
+ const {listen}=await import("@tauri-apps/api/event");
+ const handlers:Record<string,(e:{payload:unknown})=>void>={};
+ vi.mocked(listen).mockImplementation(((name:string,fn:(e:{payload:unknown})=>void)=>{handlers[name]=fn;return Promise.resolve(()=>{});}) as never);
+ const rx={exercise:"squat",kind:"REP" as const,targetReps:5,targetSeconds:0,defaultWeight:0};
+ render(<Screen snapshot={{...base,phase:"WORKOUT_ACTIVE",prescription:rx}} variant="primary"/>);
+ await waitFor(()=>expect(handlers["vision-pose"]).toBeDefined());
+ handlers["vision-pose"]({payload:{detected:false}});
+ expect(await screen.findByText(/Not in frame/)).toBeInTheDocument();
+ handlers["vision-pose"]({payload:{detected:true}});
+ expect(await screen.findByText(/In frame · tracking/)).toBeInTheDocument();
+});
