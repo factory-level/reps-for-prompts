@@ -479,6 +479,54 @@ impl Lifecycle {
         })
     }
 
+    /// Hold a debug set in a detection state. Anything but `live` turns the
+    /// camera off, so only step/done/next drive progress; `vision-down` also
+    /// reports the vision path failed, as a dead detector would.
+    pub fn debug_detection(&self, state: &str) -> Result<(), String> {
+        self.require_debug()?;
+        if state == "live" { return Ok(()); }
+        self.release_camera();
+        if state == "vision-down" { self.signal(Signal::DetectorFailed("debug: simulated vision failure".into())); }
+        Ok(())
+    }
+
+    /// Advance exactly one phase through the engine's own transitions:
+    /// code → locked → active → weight → logged → code.
+    pub fn debug_next(&self, weight: Option<f64>) -> Result<Snapshot, String> {
+        self.require_debug()?;
+        self.step(|core, now, today| {
+            let snapshot = core.session.snapshot(now);
+            let facts = match snapshot.phase {
+                Phase::Idle => return Err("No debug set yet. Run: rfp debug start --exercise NAME".into()),
+                Phase::Coding => {
+                    core.session.configure_timer(0., now);
+                    core.session.tick(now, today)
+                }
+                Phase::ExerciseRequired => core.session.start_workout(today),
+                Phase::WorkoutActive => {
+                    let rx = snapshot.prescription.ok_or("The set has no prescription")?;
+                    let (value, unit) = if rx.target_seconds > 0. { (rx.target_seconds, "seconds") } else { (rx.target_reps as f64, "reps") };
+                    core.session.report_progress(Progress { value, unit: unit.into(), satisfied: true })
+                }
+                Phase::WeightConfirmation => {
+                    let default = snapshot.prescription.map(|rx| rx.default_weight).unwrap_or(0.);
+                    core.session.confirm_weight(weight.unwrap_or(default), None, today)
+                }
+                Phase::Unlocked => {
+                    let facts = core.session.resume_coding(now);
+                    if core.session.snapshot(now).phase == Phase::Coding {
+                        let minutes = work_minutes(core);
+                        core.session.configure_timer(minutes, now);
+                    }
+                    facts
+                }
+            };
+            // A rep set reaching its target changes phase without a fact.
+            if core.session.snapshot(now).phase == snapshot.phase { return Err(format!("Cannot advance from {:?}; nothing to prescribe", snapshot.phase)); }
+            Ok(facts)
+        })
+    }
+
     // ---- Durable publishing ------------------------------------------------
 
     fn publish(&self, kind: fn(Value) -> Publication, session: Option<&str>, mut params: Value) {
@@ -1299,5 +1347,71 @@ mod tests {
         assert_eq!(workout.life.debug_start(None).unwrap_err(), "Manual testing requires Debug mode");
         assert_eq!(workout.life.debug_stop().unwrap_err(), "Manual testing requires Debug mode");
         assert_eq!(workout.life.debug_progress(None, true).unwrap_err(), "Manual testing requires Debug mode");
+        assert_eq!(workout.life.debug_next(None).unwrap_err(), "Manual testing requires Debug mode");
+    }
+
+    /// `debug next` until the phase comes back around; returns the phases seen.
+    fn walk(rig: &Rig, weight: Option<f64>) -> Vec<Phase> {
+        let mut phases = vec![rig.life.snapshot().phase];
+        while phases.len() == 1 || *phases.last().unwrap() != Phase::Coding {
+            phases.push(rig.life.debug_next(weight).unwrap().phase);
+            // The camera runs exactly while the set does: gated by the facts.
+            assert_eq!(rig.active(), *phases.last().unwrap() == Phase::WorkoutActive);
+        }
+        phases
+    }
+
+    #[test]
+    fn debug_next_walks_a_weighted_lift_from_coding_back_to_coding() {
+        let rig = rig(LIFTS, Some(FakeHub::new(vec![])), true);
+        assert_eq!(walk(&rig, Some(42.5)), [
+            Phase::Coding, Phase::ExerciseRequired, Phase::WorkoutActive,
+            Phase::WeightConfirmation, Phase::Unlocked, Phase::Coding,
+        ]);
+        let history = rig.life.core().store.history(10).unwrap();
+        assert_eq!((history[0].exercise.as_str(), history[0].reps, history[0].weight), ("squat", 5, 42.5));
+        assert_eq!(rig.life.snapshot().remaining_seconds, 1500.0);
+        assert!(rig.types().is_empty());
+    }
+
+    #[test]
+    fn debug_next_walks_a_timed_set_without_weight_confirmation() {
+        let rig = rig(r#"{"conditioning":[{"exercise":"jumprope","seconds":60},{"exercise":"jumprope","seconds":60}]}"#, Some(FakeHub::new(vec![])), true);
+        assert_eq!(walk(&rig, None), [
+            Phase::Coding, Phase::ExerciseRequired, Phase::WorkoutActive, Phase::Unlocked, Phase::Coding,
+        ]);
+        let history = rig.life.core().store.history(10).unwrap();
+        assert_eq!((history[0].exercise.as_str(), history[0].seconds), ("jumprope", 60.0));
+    }
+
+    #[test]
+    fn debug_next_from_idle_says_to_start_a_debug_set() {
+        let rig = rig(LIFTS, None, true);
+        let _ = rig.life.end_workout();
+        assert_eq!(rig.life.snapshot().phase, Phase::Idle);
+        assert_eq!(rig.life.debug_next(None).unwrap_err(), "No debug set yet. Run: rfp debug start --exercise NAME");
+    }
+
+    #[test]
+    fn debug_detection_states_turn_the_camera_off_and_vision_down_is_unavailable() {
+        let rig = rig(LIFTS, Some(FakeHub::new(vec![])), true);
+        let squat = || detector::debug_exercise_options().unwrap().into_iter().find(|rx| rx.exercise == "squat");
+        rig.life.debug_start(squat()).unwrap();
+        rig.life.debug_detection("live").unwrap();
+        assert!(rig.active());
+
+        rig.life.debug_detection("counting").unwrap();
+        assert!(!rig.active());
+        assert_eq!(rig.calls().last().unwrap(), "disable:workout");
+        assert_eq!(rig.life.vision_status(), VisionStatus::Available);
+
+        rig.life.debug_start(squat()).unwrap();
+        rig.life.debug_detection("vision-down").unwrap();
+        let down = VisionStatus::Unavailable { reason: "debug: simulated vision failure".into() };
+        assert_eq!(rig.life.vision_status(), down);
+        assert_eq!(rig.effects.0.lock().unwrap().vision.last().unwrap(), &down);
+        // Progress still comes from the CLI, and the end of the set clears it.
+        rig.life.debug_next(None).unwrap();
+        assert_ne!(rig.life.vision_status(), down);
     }
 }

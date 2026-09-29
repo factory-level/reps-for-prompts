@@ -3,14 +3,15 @@ use std::collections::HashMap;
 pub fn execute(args:&[String])->Result<serde_json::Value,String>{
  let group=args[0].as_str();
  if group=="mode"&&std::env::var_os("REPS_APP_HOME").is_some(){return Err("Mode switching requires the installed user service; unset REPS_APP_HOME".into());}
- let rest:Vec<_>=args.iter().skip(1).filter(|s|s.as_str()!="--json").collect();
+ let all=group=="debug"&&args.iter().any(|s|s=="--all");
+ let rest:Vec<_>=args.iter().skip(1).filter(|s|s.as_str()!="--json"&&s.as_str()!="--all").collect();
  let mut opts=HashMap::new();let mut positional=Vec::new();let mut i=0;
  while i<rest.len(){if rest[i].starts_with("--"){
   let val=rest.get(i+1).ok_or("Missing option value")?;
   if opts.insert(rest[i].as_str(),val.as_str()).is_some(){return Err("Duplicate option".into());}i+=2;
  }else{positional.push(rest[i].as_str());i+=1;}}
  if positional.len()>1{return Err("Unexpected argument".into());}
- let allowed:&[&str]=match group{"workday"=>&["--end","--warn-minutes"],"mode"=>&[],"camera"=>&["--file","--device","--rotation","--phone-url","--phone-rotation","--consensus"],"debug"=>&["--exercise","--value","--file"],"display"=>&["--window","--visible","--fullscreen","--monitor"],_=>return Err("Unknown command group".into())};
+ let allowed:&[&str]=match group{"workday"=>&["--end","--warn-minutes"],"mode"=>&[],"camera"=>&["--file","--device","--rotation","--phone-url","--phone-rotation","--consensus"],"debug"=>&["--exercise","--value","--file","--state","--reps","--seconds","--weight"],"display"=>&["--window","--visible","--fullscreen","--monitor"],_=>return Err("Unknown command group".into())};
  if let Some(k)=opts.keys().find(|k|!allowed.contains(k)){return Err(format!("Unknown option {k}"));}
  let boolean=|key:&str|->Result<Option<bool>,String>{opts.get(key).map(|v|match *v{"on"=>Ok(true),"off"=>Ok(false),_=>Err(format!("{key} must be on or off"))}).transpose()};
  let request=match group{
@@ -20,7 +21,13 @@ pub fn execute(args:&[String])->Result<serde_json::Value,String>{
    if !positional.is_empty(){return Err("Use display flags, without a subcommand".into());}
    Command::Display{window:opts.get("--window").unwrap_or(&"main").to_string(),visible:boolean("--visible")?,fullscreen:boolean("--fullscreen")?,monitor:opts.get("--monitor").map(|s|s.parse().map_err(|_|"Invalid monitor index")).transpose()?}
   },
-  "debug"=>Command::Debug{operation:positional.first().copied().unwrap_or("exercises").into(),exercise:opts.get("--exercise").map(|s|s.to_string()),value:opts.get("--value").map(|s|s.parse().map_err(|_|"Invalid progress value")).transpose()?,video:opts.get("--file").map(|s|std::fs::canonicalize(s).map(|p|p.to_string_lossy().into_owned()).map_err(|e|e.to_string())).transpose()?},
+  // Tired, or the detector missed it: attest the current set, in any mode.
+  "debug" if positional.first()==Some(&"complete")=>Command::Finish{weight:opts.get("--weight").map(|s|s.parse().map_err(|_|"Invalid weight")).transpose()?.unwrap_or(0.),honor:true},
+  "debug"=>{
+   let number=|key:&str|opts.get(key).map(|s|s.parse::<f64>().map_err(|_|format!("Invalid {key}"))).transpose();
+   Command::Debug{operation:positional.first().copied().unwrap_or("exercises").into(),exercise:opts.get("--exercise").map(|s|s.to_string()),value:number("--value")?,video:opts.get("--file").map(|s|std::fs::canonicalize(s).map(|p|p.to_string_lossy().into_owned()).map_err(|e|e.to_string())).transpose()?,
+    state:opts.get("--state").map(|s|s.to_string()),reps:opts.get("--reps").map(|s|s.parse().map_err(|_|"Invalid --reps")).transpose()?,seconds:number("--seconds")?,weight:number("--weight")?,all}
+  },
   "camera"=>{
    let operation=positional.first().copied().unwrap_or("status");
    if operation!="set"&&!opts.is_empty(){return Err("Camera options require: rfp camera set".into());}
