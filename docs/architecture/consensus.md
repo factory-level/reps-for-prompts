@@ -1,4 +1,4 @@
-# Reps consensus implementation
+# RFP consensus implementation
 
 The desktop saves camera choices in `cameras.json` under normal application data.
 Timing calibration is loaded from sibling `camera-calibration.json` at enable.

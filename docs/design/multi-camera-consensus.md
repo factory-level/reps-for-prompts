@@ -1,6 +1,6 @@
-# Reps multi-camera contract
+# RFP multi-camera contract
 
-Reps selects cameras and requests strict hub-owned 2-of-2 consensus for rep
+RFP selects cameras and requests strict hub-owned 2-of-2 consensus for rep
 workouts. It never adds per-camera counts. API 1.6 progress preserves session
 identity and consensus diagnostics; events precede credited progress. The hub
 pins movement/model identity and settings. Legacy single-camera behavior remains

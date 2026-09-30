@@ -19,7 +19,7 @@ single-camera option for ordinary workouts.
 The full connection, calibration, recording and held-out comparison procedure is
 in the sibling hub's [USB + phone guide](../../../usb-mcp-hub/docs/wiki/usb-phone-consensus.md).
 From the workspace root, run
-`reps-for-claude/vision/.venv/bin/python reps-for-claude/scripts/check-phone-camera.py`
+`reps-for-prompts/vision/.venv/bin/python reps-for-prompts/scripts/check-phone-camera.py`
 for a short simultaneous connection check. It saves no video and releases both
 cameras. Automated tests passing does not mean multi-camera accuracy is proven.
 
