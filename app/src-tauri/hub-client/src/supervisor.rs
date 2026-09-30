@@ -14,6 +14,9 @@ use crate::{
 
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 const RESTART_BACKOFF: Duration = Duration::from_millis(500);
+/// Bounds for retrying a hub that never came up at all (see start_retrying).
+const START_RETRY_BACKOFF: Duration = Duration::from_millis(500);
+const START_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// True if something is currently listening on `127.0.0.1:port`.
 fn port_in_use(port: u16) -> bool {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
@@ -46,6 +49,7 @@ impl Drop for StartingChild {
     }
 }
 
+#[derive(Clone)]
 pub struct HubSupervisorConfig {
     /// Directory of the usb-mcp-hub checkout or bundle.
     pub hub_dir: std::path::PathBuf,
@@ -158,6 +162,42 @@ impl HubSupervisor {
         };
         supervisor.spawn_and_connect()?;
         Ok(supervisor)
+    }
+
+    /// Like `start`, but keeps trying after a failure that is usually
+    /// transient: a leaked hubd still holding the port, or a previous instance
+    /// mid-shutdown. A single failed attempt used to leave the desktop in honor
+    /// mode for the life of the process even once the port was free again.
+    ///
+    /// Backs off from `START_RETRY_BACKOFF` to `START_RETRY_BACKOFF_MAX`,
+    /// reporting every failure through `on_error`. Returns `None` as soon as
+    /// `stopping` is true, including partway through a backoff, so quitting
+    /// never waits out the delay.
+    pub fn start_retrying(
+        config: HubSupervisorConfig,
+        stopping: impl Fn() -> bool,
+        mut on_error: impl FnMut(&HubError, Duration),
+    ) -> Option<Self> {
+        let mut delay = START_RETRY_BACKOFF;
+        loop {
+            if stopping() {
+                return None;
+            }
+            match Self::start(config.clone()) {
+                Ok(supervisor) => return Some(supervisor),
+                Err(error) => {
+                    on_error(&error, delay);
+                    let deadline = Instant::now() + delay;
+                    while Instant::now() < deadline {
+                        if stopping() {
+                            return None;
+                        }
+                        std::thread::sleep(Duration::from_millis(100).min(delay));
+                    }
+                    delay = (delay * 2).min(START_RETRY_BACKOFF_MAX);
+                }
+            }
+        }
     }
 
     fn spawn_and_connect(&mut self) -> Result<(), HubError> {
@@ -440,6 +480,33 @@ mod port_tests {
         });
         assert!(matches!(result, Err(HubError::Io(message)) if message.contains("refusing to terminate")));
         assert!(port_in_use(port));
+    }
+
+    #[test]
+    fn a_failed_start_is_retried_instead_of_dropping_to_honor_mode_forever() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let dir = tempfile::tempdir().unwrap();
+        let stopping = Arc::new(AtomicBool::new(false));
+        let attempts = Arc::new(Mutex::new(0u32));
+        let quit = Arc::clone(&stopping);
+        let seen = Arc::clone(&attempts);
+        let result = HubSupervisor::start_retrying(
+            HubSupervisorConfig {
+                hub_dir: dir.path().into(), command: vec!["must-not-execute".into()],
+                env: vec![("PORT".into(), port.to_string())],
+            },
+            { let stopping = Arc::clone(&stopping); move || stopping.load(Ordering::SeqCst) },
+            move |_error, _delay| {
+                let mut count = seen.lock().unwrap();
+                *count += 1;
+                // Let it prove it comes back, then release it.
+                if *count >= 3 { quit.store(true, Ordering::SeqCst); }
+            },
+        );
+        assert!(result.is_none(), "must give up only when asked to stop");
+        assert_eq!(*attempts.lock().unwrap(), 3, "a failed start must be retried");
+        assert!(port_in_use(port), "retrying must not kill the port's owner");
     }
 
     #[cfg(unix)]

@@ -326,3 +326,87 @@ rfp profile --clear-location         # remove it from profile and all past posts
 ```
 
 Location is unset by default and never detected automatically. Each site has its own profile. Completed/target daily routine snapshots sync with workouts; the showcase colors each day by that guest's own completion percentage. Tracking begins when this version runs, with no invented historical goals. Missing days remain untracked. The site is now a short GitHub-linked explanation beside rotating guest heatmaps; labeled demo profiles fill empty spaces without database writes.
+
+### CLI end-to-end dogfood — 2026-09-25
+
+Whole ladder run in one sitting against the **installed** build
+(`~/.local/lib/rfp`, hub API 1.6), reps `b03d973` + hub `bd0d726`. Zero real
+workout credit: `rfp history` was byte-identical before and after, the day
+stayed at 7/31 sets, `NRestarts=0`, and no coredumps.
+
+- `qualify-software.mjs --with-bundle --with-video`: PASS, 9/9 checks. Hub 231
+  tests / 49 files, hub pytest 118, detector pytest 137, desktop 30 tests / 6
+  files, `tsc --noEmit` clean, Rust 90 passed / 1 ignored. Recorded
+  public-video challenge failure: `curl-camera-cuts`.
+- `e2e-latency.mjs --movement-contract`: E2E PASS, frames=198, reps=2,
+  p50 22.7 ms / p95 26.8 ms.
+- `e2e-latency.mjs --bundle --parent-exit`: E2E PASS, frames=192, reps=2,
+  p50 22.8 ms / p95 27.0 ms, parent-pipe shutdown clean.
+- `e2e-two-camera.mjs`: PASS, fusedLandmarks=219, reps=2, election
+  `null->front,front->side` — count survived the occlusion.
+- Hub `demo-n1.sh`: PASS. Snapshot action now verified through
+  `query_history action_result`: `snapshot.executed` succeeded in 18 ms with a
+  real `imageRef`.
+- Hub `demo-n2.sh`: PASS, including the no-consent refusal
+  (`authoring_consent_required`) and webhook delivery of `prompt_matched`.
+- `verify-cli-dogfood.py`: both PASS lines. Camera preview opened the real
+  webcam (`framesSeen=39`, `previewOnly=true`); workout mode correctly rejected
+  `start`, `finish`, `debug done` and `--lock-mode on`.
+- `verify-camera-gating.sh 8081` against the live installed hub:
+  `CAMERA GATING OK` — `/dev/video0` unheld before, held during, unheld after.
+- Read-only surfaces: `rfp inspect` (Claude detected, Codex not),
+  `rfp site` / `rfp profile` (no secrets in output), and a real HTTPS read
+  roundtrip via `rfp status|history --source remote` against Vercel. No upload
+  was triggered.
+- `verify-passive.py`: PASS on both isolated launches.
+- `verify-daemon.py`: PASS after the time-of-day fix below.
+
+Fixed while running:
+
+- `qualify-software.mjs` pointed `UV_CACHE_DIR` at a **fresh empty temp dir**
+  and then set `UV_OFFLINE=1`, so `detector`, `public-video` and `bundle` could
+  never pass. Now defaults to `~/.cache/uv`.
+- `verify-daemon.py` waited for daemon state `counting`, but the end-of-day
+  warning is due whenever local minute >= `workday_end - warn`, so the stock
+  18:00 default fires immediately after 17:00 local and the state never
+  arrives. The disposable profile now pre-seeds `workday_end` ahead of now.
+- `demo-n1.sh` claimed to expect `snapshot_captured` from `poll_events`; the
+  hub emits `snapshot.executed` as an *action result*, so the snapshot half of
+  the N1 gate was never actually checked. Corrected and now asserted.
+- `demo-n1.sh` / `demo-n2.sh` hardcoded their ports; both now honor `PORT` /
+  `DEBUG_PORT` (8085 was occupied by an unrelated service on this machine).
+
+Defects found and fixed — 2026-09-28:
+
+- **Hub supervisor never retried a failed start.** If port 8443 was briefly
+  occupied when the app launched, it logged `hub: failed to start … honor mode
+  only` once and stayed in honor mode for the life of the process — observed
+  still down two minutes after the port was free, recoverable only by restart.
+  This was the documented "nothing is detected" symptom: `free-hub.sh` treated
+  the cause, nothing treated the stuck state.
+  `HubSupervisor::start_retrying` now retries with backoff from 500 ms to a
+  30 s cap, abandoning the wait the moment the app is stopping. Covered by
+  `hub-client` unit test
+  `a_failed_start_is_retried_instead_of_dropping_to_honor_mode_forever`.
+  Verified live: with the port held, the log showed `retrying in 0.5s / 1s / 2s
+  / 4s / 8s`; freeing the port brought `visionHost: up` within ~12 s with no
+  restart.
+- **The status message lied during that state.** `rfp camera status` reported
+  `Vision hub is starting` indefinitely. `hub::unavailable_reason()` now
+  distinguishes "still starting" from a failed start and reports the cause:
+  `Vision hub is not running (hub io error: hub port 8443 is in use; refusing
+  to terminate another process); retrying in the background`.
+- **Long `REPS_APP_HOME` panicked opaquely.** `control.sock` is a Unix socket,
+  so a data dir that pushed it past the 108-byte `sun_path` limit aborted with
+  libstd's bare `path must be shorter than SUN_LEN`. The bind site now checks
+  the length first and reports the path, the byte count, the limit and the
+  remedy. It still surfaces as a Tauri setup panic — Tauri panics on any setup
+  error — but it now says what to do.
+
+These three were verified against freshly built binaries; installing them over
+the running dogfood build is a separate, deliberate step
+(`python3 scripts/install-dogfood.py`).
+
+Still hands-and-eyes only: hubd killed mid-set (single restart, then honor
+fallback with `verified = 0`), the physical camera LED, the phone tuning app,
+jump-rope streak reset, physical rep accuracy, and the workday soak.

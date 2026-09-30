@@ -1,12 +1,22 @@
 #!/usr/bin/env python3
 """Exercise the installed daemon with a disposable profile and no cloud config."""
-import json, os, signal, subprocess, tempfile, time
+import json, os, signal, sqlite3, subprocess, tempfile, time
+from datetime import datetime
 from pathlib import Path
 home=Path.home(); app=home/'.local/lib/rfp/bin/app'; cli=home/'.local/bin/rfp'
 def service(action): subprocess.run(['systemctl','--user',action,'rfp.service'],check=True)
 proc=None
 with tempfile.TemporaryDirectory(prefix='rfp-watcher-test-') as folder:
     profile=Path(folder); (profile/'mode.json').write_text('"workout"')
+    # The end-of-day warning is due whenever local minute >= workday_end - warn,
+    # so the stock 18:00 default fires instantly after 17:00 and the daemon never
+    # reaches 'counting'. Park the deadline ahead of now; the test arms the warning
+    # itself later with --end 00:00.
+    # ponytail: no date in the setting, so a run starting after 23:58 still warns early.
+    ahead=min(datetime.now().hour*60+datetime.now().minute+90,1439)
+    with sqlite3.connect(profile/'reps.sqlite') as db:
+        db.execute('create table settings(key text primary key,value text not null)')
+        db.execute('insert into settings values(?,?)',('workday_end',f'{ahead//60:02d}:{ahead%60:02d}'))
     env=dict(os.environ, REPS_APP_HOME=folder)
     env.setdefault('DISPLAY',':0')
     def command(*args): return json.loads(subprocess.check_output([str(cli),*args,'--json'],env=env,text=True))

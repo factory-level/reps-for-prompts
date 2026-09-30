@@ -2,7 +2,7 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync, openSync, closeSync, lstatSync, readlinkSync } from 'node:fs';
-import { tmpdir, platform, release, cpus } from 'node:os';
+import { tmpdir, platform, release, cpus, homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -64,7 +64,7 @@ const report = {schemaVersion:1, startedAt:new Date().toISOString(), evidence:'s
     'Consented account-specific cloud authoring',
     'Hosted CI execution and backups/capacity monitoring',
   ]};
-const env = {...process.env,UV_CACHE_DIR:process.env.UV_CACHE_DIR ?? join(temporary,'uv-cache'),UV_OFFLINE:'1',UV_FROZEN:'1',
+const env = {...process.env,UV_CACHE_DIR:process.env.UV_CACHE_DIR ?? join(homedir(),'.cache/uv'),UV_OFFLINE:'1',UV_FROZEN:'1',
   HUB_DATA_DIR:join(temporary,'hub'),REPS_HOME:join(temporary,'reps'),PYTHONDONTWRITEBYTECODE:'1',
   REPS_POSE_MODEL:join(root,'app/src-tauri/resources/models/pose_landmarker_full.task')};
 // Do not inherit opt-in cameras, plugins, or authoring settings into test hosts.

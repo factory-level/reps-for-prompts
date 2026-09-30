@@ -464,6 +464,22 @@ pub fn enable_on_hub(
     Ok(())
 }
 
+/// Why the hub slot is empty: still starting, or failed and retrying. Keeps
+/// `rfp camera status` from claiming the hub "is starting" forever after a
+/// start that actually failed.
+static LAST_HUB_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn set_hub_error(error: Option<String>) {
+    if let Ok(mut slot) = LAST_HUB_ERROR.lock() { *slot = error; }
+}
+
+pub fn unavailable_reason() -> String {
+    match LAST_HUB_ERROR.lock().ok().and_then(|slot| slot.clone()) {
+        Some(error) => format!("Vision hub is not running ({error}); retrying in the background"),
+        None => "Vision hub is starting".into(),
+    }
+}
+
 /// Start the supervisor in the background and pump its events into the
 /// session. No-op when REPS_HUB_DISABLED is set (dev without a hub).
 pub fn start(app: AppHandle) {
@@ -503,11 +519,24 @@ pub fn start(app: AppHandle) {
                     ("HUB_CERT_DIR".into(), app.state::<crate::Runtime>().session_home.join("no-certs").display().to_string()),
                 ]);
             }
+            // Retry rather than stranding the camera: a leaked hubd or a
+            // previous instance mid-shutdown holds the port for seconds, and a
+            // single failure used to mean honor mode until the app restarted.
+            let supervisor = HubSupervisor::start_retrying(
+                config,
+                { let app = app.clone(); move || app.state::<crate::Runtime>().is_stopping() },
+                { let app = app.clone(); move |error, delay| {
+                    set_hub_error(Some(error.to_string()));
+                    eprintln!("hub: failed to start ({error}); honor mode, retrying in {}s", delay.as_secs_f32());
+                    let _ = app.emit("vision-fallback", serde_json::json!({"reason": error.to_string()}));
+                } },
+            );
             let state = app.state::<SharedHub>();
             let mut slot = state.lock().unwrap();
             if app.state::<crate::Runtime>().is_stopping() { return; }
-            match HubSupervisor::start(config) {
-                Ok(mut supervisor) => {
+            match supervisor {
+                Some(mut supervisor) => {
+                    set_hub_error(None);
                     if app.state::<crate::Runtime>().is_stopping() { return; }
                     // A desktop restart begins idle rather than restoring an old camera stream.
                     let _ = supervisor.disable_metric(WORKOUT_METRIC);
@@ -528,10 +557,8 @@ pub fn start(app: AppHandle) {
                         pump_events(app, rx);
                     }
                 }
-                Err(err) => {
-                    eprintln!("hub: failed to start ({err}); honor mode only");
-                    let _ = app.emit("vision-fallback", serde_json::json!({"reason": err.to_string()}));
-                }
+                // Only reachable once the app is shutting down.
+                None => {}
             }
         })
         .ok();
