@@ -66,7 +66,7 @@ fn dispatch(app:&AppHandle, command:Command)->Result<serde_json::Value,String>{
     "stop"=>stop_preview(app),
     "status"=>{
      let state=app.state::<crate::hub::SharedHub>();let mut hub=state.lock().unwrap();
-     let health=hub.as_mut().ok_or("Vision hub is starting")?.health().map_err(|e|e.to_string())?;
+     let health=hub.as_mut().ok_or_else(crate::hub::unavailable_reason)?.health().map_err(|e|e.to_string())?;
      return Ok(serde_json::json!({"visionHost":health.vision_host,"camera":health.camera,"enabledMetrics":health.enabled_metrics,"display":get_display_state(app.clone())}));
     },_=>unreachable!()
    }
@@ -136,6 +136,16 @@ pub fn start(app:&AppHandle)->Result<(),String>{
  #[cfg(unix)] {
   use std::{os::unix::{net::UnixListener,fs::PermissionsExt,io::AsRawFd},io::{BufRead,BufReader,Read,Write},time::Duration};
   let path=app.state::<Runtime>().normal_home.join("control.sock");
+  // A Unix socket address is a fixed 108-byte sun_path on Linux, so a long data
+  // directory makes bind fail with libstd's bare "path must be shorter than
+  // SUN_LEN" — which Tauri then reports as an unexplained setup panic.
+  // REPS_APP_HOME is a documented knob and temp paths blow the limit easily, so
+  // say what is wrong and how to fix it.
+  const SUN_PATH_MAX:usize=108;
+  let length=path.as_os_str().as_encoded_bytes().len()+1; // +1 for the NUL
+  if length>SUN_PATH_MAX{
+   return Err(format!("data directory path is too long: the control socket {} needs {length} bytes, over the {SUN_PATH_MAX}-byte Unix socket limit. Point REPS_APP_HOME at a shorter path.",path.display()));
+  }
   // The desktop instance lock is already held, so a prior socket is stale.
   if path.exists(){std::fs::remove_file(&path).map_err(|e|e.to_string())?;}
   let listener=UnixListener::bind(&path).map_err(|e|e.to_string())?;
