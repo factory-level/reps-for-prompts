@@ -1,7 +1,7 @@
 # RFP documentation — human guide, as-built architecture and design.
 # Local preview: uvx --with mkdocs-material mkdocs serve
 site_name: RFP
-site_description: A fitness pomodoro that locks your machine until the webcam sees you exercise.
+site_description: "Reps for prompts: exercise while your coding agent thinks."
 docs_dir: docs
 hooks:
   - docs_tools/links.py
@@ -65,4 +65,9 @@ nav:
   - Architecture:
       - As built: architecture/index.md
       - Detection and sensitivity: architecture/detection.md
-  - Design: design/index.md
+      - Multi-camera consensus: architecture/consensus.md
+      - Dogfood setup and limits: production/rfp-dogfood.md
+  - Design:
+      - Intent: design/index.md
+      - Multi-camera consensus: design/multi-camera-consensus.md
+      - Workout debt desktop (spec): superpowers/specs/2026-08-31-workout-debt-desktop.md

@@ -6,7 +6,7 @@ than the retired Python `config.toml` file.
 | Setting | Location / behavior |
 |---|---|
 | Data directory | `~/.local/share/rfp`; override with `REPS_APP_HOME` |
-| Coding timer | Persisted `work_minutes`, default 6; `REPS_WORK_MINUTES` overrides for testing |
+| Coding timer | Persisted `work_minutes`, default 25; `REPS_WORK_MINUTES` overrides for testing |
 | Daily routine | `routine.json` in the data directory; otherwise the bundled routine |
 | Detector presets | Embedded `app/src-tauri/resources/exercise_specs.json`; source edits need a rebuild |
 | Activated movement rules | Stored by the hub; selected at workout start and pinned for that workout |
