@@ -38,6 +38,8 @@ use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
 
 mod detector;
 mod hub;
+#[allow(dead_code)] // wired up in the next commit
+mod vision_status;
 mod windows;
 mod runtime;
 mod daily;
