@@ -1,9 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
-import { useEffect, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import type { Snapshot } from "./snapshot";
 
 export type Variant = "primary" | "gym";
+/** The backend's one answer to "is the camera/vision path working right now?" */
+export type Vision = { state: "starting" | "available" | "unavailable"; reason?: string };
 
 
 export const mmss = (s: number) =>
@@ -105,18 +106,10 @@ function GymStatus({ snapshot, debug }: { snapshot: Snapshot; debug: boolean }) 
   }
 }
 
-export function Screen({ snapshot, variant, debug = false }: { snapshot: Snapshot; variant: Variant; debug?: boolean }) {
+export function Screen({ snapshot, variant, debug = false, vision }: { snapshot: Snapshot; variant: Variant; debug?: boolean; vision?: Vision }) {
   const coding = snapshot.phase === "CODING";
   const mode = coding ? "code" : "workout";
-  const [fallback, setFallback] = useState(false);
-  useEffect(() => {
-    if (coding) setFallback(false);
-  }, [coding]);
-  useEffect(() => {
-    let active=true;let remove:(()=>void)|undefined;
-    void listen<{reason:string}>("vision-fallback",()=>{if(active)setFallback(true);}).then(fn=>{if(active)remove=fn;else fn();});
-    return()=>{active=false;remove?.();};
-  },[]);
+  const fallback = vision?.state === "unavailable" && snapshot.phase === "WORKOUT_ACTIVE";
 
   // Set logged → whole-screen takeover for the beat before CODE.
   if (snapshot.phase === "UNLOCKED") {

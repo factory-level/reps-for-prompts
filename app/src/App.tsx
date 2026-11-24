@@ -2,10 +2,10 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useEffect, useState } from "react";
 import "./retro.css";
-import { Screen, type Variant } from "./Screen";
+import { Screen, type Variant, type Vision } from "./Screen";
 import { PassivePreview } from "./PassivePreview";
 import { useSnapshot } from "./useSnapshot";
-type Display = {notice?:string|null;view:"screen"|"camera"|"video";previewOnly:boolean;lastError:string|null};
+type Display = {notice?:string|null;view:"screen"|"camera"|"video";previewOnly:boolean;lastError:string|null;vision?:Vision};
 const variant: Variant = new URLSearchParams(window.location.search).get("window") === "gym" ? "gym" : "primary";
 export default function App() {
  const snapshot=useSnapshot();
@@ -21,6 +21,6 @@ export default function App() {
  if(error)return <p role="alert">RFP display unavailable: {error}</p>;
  if(!snapshot||!mode)return <p className="small">Connecting to RFP…</p>;
  return <main className="passive-app">{display.notice&&<aside className="day-warning" role="status">{display.notice}</aside>}{variant==="primary"&&display.view!=="screen"?
-  <PassivePreview kind={display.view} error={display.lastError}/>:
-  <Screen snapshot={snapshot} variant={variant} debug={mode==="debug"}/>}</main>;
+  <PassivePreview kind={display.view} error={display.lastError} vision={display.vision}/>:
+  <Screen snapshot={snapshot} variant={variant} debug={mode==="debug"} vision={display.vision}/>}</main>;
 }
