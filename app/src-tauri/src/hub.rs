@@ -11,44 +11,13 @@ use engine::types::Progress;
 use hub_client::{EnableMetric, HubSupervisor, HubSupervisorConfig, VisionEvent, VisionHub};
 use tauri::{AppHandle, Emitter, Manager};
 
-pub const EXERCISE_SPECS: &str = include_str!("../resources/exercise_specs.json");
+use crate::detector::{self, CameraSet, CameraSettings};
+
 pub const WORKOUT_METRIC: &str = "workout";
 pub const APP_ID: &str = "reps";
 
-
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CameraSettings {
-    pub consensus: bool,
-    pub usb_device: String,
-    #[serde(default = "default_usb_rotation")]
-    pub usb_rotation: u16,
-    pub phone_url: String,
-    pub phone_rotation: u16,
-}
-fn default_usb_rotation() -> u16 { 180 }
-fn phone_stream_url(value: &str) -> bool {
-    ["rtsp://", "rtsps://", "http://", "https://"].iter().any(|prefix| value.starts_with(prefix))
-}
-impl Default for CameraSettings {
-    fn default() -> Self { Self { consensus: false, usb_device: "/dev/video0".into(), usb_rotation: default_usb_rotation(), phone_url: String::new(), phone_rotation: 0 } }
-}
-/// The saved camera choice; `None` when there is no `cameras.json`, which
-/// leaves the env camera index in charge.
-pub fn load_camera_settings(normal_home: &std::path::Path) -> Result<Option<CameraSettings>, String> {
-    match std::fs::read(normal_home.join("cameras.json")) {
-        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|e| e.to_string()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.to_string()),
-    }
-}
 pub fn save_camera_settings(app: AppHandle, settings: CameraSettings) -> Result<(), String> {
-    if !matches!(settings.usb_rotation, 0 | 90 | 180 | 270) || !matches!(settings.phone_rotation, 0 | 90 | 180 | 270) || !settings.usb_device.starts_with("/dev/video") {
-        return Err("Choose a /dev/video device and a valid rotation".into());
-    }
-    if settings.consensus && (!phone_stream_url(&settings.phone_url) || settings.phone_url.contains('@')) {
-        return Err("Enter an RTSP or HTTP MJPEG URL without embedded credentials".into());
-    }
+    settings.validate()?;
     let path = app.state::<crate::Runtime>().normal_home.join("cameras.json");
     std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
     let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
@@ -287,132 +256,6 @@ pub(crate) fn publish_facts(facts: &[Fact]) {
     }
 }
 
-/// Parse and sanity-check the shipped specs at startup: the model must be
-/// declared and every exercise must name a known activity.
-pub fn load_exercise_specs() -> Result<serde_json::Value, String> {
-    let specs: serde_json::Value =
-        serde_json::from_str(EXERCISE_SPECS).map_err(|e| format!("exercise_specs.json: {e}"))?;
-    let model = specs
-        .get("model")
-        .and_then(|m| m.get("plugin"))
-        .and_then(|p| p.as_str())
-        .ok_or("exercise_specs.json: missing model.plugin declaration")?;
-    if model.is_empty() {
-        return Err("exercise_specs.json: empty model.plugin".into());
-    }
-    let exercises = specs
-        .get("exercises")
-        .and_then(|e| e.as_object())
-        .ok_or("exercise_specs.json: missing exercises")?;
-    for (name, entry) in exercises {
-        let activity = entry.get("activity").and_then(|a| a.as_str()).unwrap_or("");
-        if !matches!(activity, "lift" | "jumprope" | "stretch") {
-            return Err(format!("exercise {name}: unknown activity {activity:?}"));
-        }
-    }
-    Ok(specs)
-}
-
-/// The enable_metric config for a prescription: shipped exercise definition
-/// + targets + camera selection.
-pub fn metric_config_for(
-    specs: &serde_json::Value,
-    exercise: &str,
-    target_reps: u32,
-    target_seconds: f64,
-) -> Option<(String, serde_json::Value)> {
-    let plugin_id = specs["model"]["plugin"].as_str()?.to_string();
-    let mut config = match specs["exercises"].get(exercise) {
-        Some(config) => config.clone(),
-        // A Studio movement needs no compiled exercise registry entry. Without
-        // a legacy exercise fallback the hub requires an activated version.
-        None if target_reps > 0 && !exercise.trim().is_empty() => {
-            serde_json::json!({"activity": "lift", "movementId": exercise})
-        }
-        None => return None,
-    };
-    let object = config.as_object_mut()?;
-    if object.get("activity").and_then(|a| a.as_str()) == Some("lift") {
-        object.insert("movementId".into(), serde_json::json!(exercise));
-        object.insert("targetReps".into(), serde_json::json!(target_reps));
-    } else if target_seconds > 0.0 {
-        object.insert("targetSeconds".into(), serde_json::json!(target_seconds));
-    }
-    let camera_index: i64 = std::env::var("REPS_CAMERA_INDEX")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    // The rig's webcam is mounted upside-down, and every exercise was tuned on
-    // frames rotated 180° — so the app must rotate identically or the joint
-    // angles are inverted and no rep crosses its thresholds. Overridable for
-    // other setups via REPS_CAMERA_ROTATE (0/90/180/270).
-    let camera_rotate: i64 = std::env::var("REPS_CAMERA_ROTATE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(180);
-    object.insert(
-        "camera".into(),
-        serde_json::json!({"source": "index", "value": camera_index, "id": "webcam", "rotate": camera_rotate}),
-    );
-    Some((plugin_id, config))
-}
-
-/// A camera-set declaration from exercise specs: registry entries to
-/// register, the set to fuse across, and the fusion policy.
-pub struct CameraSet {
-    pub registry: Vec<serde_json::Value>,
-    pub cameras: Vec<String>,
-    /// Per-camera config deltas applied after enable (tuning overlays).
-    pub overlays: Vec<(String, serde_json::Value)>,
-}
-
-/// When the specs declare a camera set, strip the injected single-camera
-/// object, put the fusion policy into the config, and return the set.
-pub fn apply_camera_set(
-    specs: &serde_json::Value,
-    config: &mut serde_json::Value,
-) -> Option<CameraSet> {
-    let block = specs.get("cameras")?;
-    let cameras: Vec<String> = block
-        .get("set")
-        .and_then(|s| s.as_array())
-        .map(|set| set.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-        .unwrap_or_default();
-    if cameras.len() < 2 {
-        eprintln!("hub: cameras.set needs >= 2 camera ids; falling back to single camera");
-        return None;
-    }
-    let registry = block
-        .get("registry")
-        .and_then(|r| r.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let object = config.as_object_mut()?;
-    object.remove("camera");
-    object.insert(
-        "fusion".into(),
-        block
-            .get("fusion")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({"policy": "best", "scoreField": "visibility"})),
-    );
-    let overlays = block
-        .get("overlays")
-        .and_then(|o| o.as_object())
-        .map(|map| {
-            map.iter()
-                .filter(|(camera_id, _)| cameras.contains(camera_id))
-                .map(|(camera_id, delta)| (camera_id.clone(), delta.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
-    Some(CameraSet {
-        registry,
-        cameras,
-        overlays,
-    })
-}
-
 /// Drive a hub through camera-set setup: register cameras, enable the
 /// metric, then apply per-camera overlays. Extracted from the async enable
 /// path so the ordering is unit-testable against the fake hub.
@@ -636,15 +479,17 @@ pub fn enable_metric_async(app: &AppHandle, exercise: String, target_reps: u32, 
     let app = app.clone();
     std::thread::spawn(move || {
         if app.state::<crate::Runtime>().is_stopping() { return; }
-        let mut specs = match load_exercise_specs() {
+        let specs = match detector::load_exercise_specs() {
             Ok(specs) => specs,
             Err(err) => {
                 eprintln!("hub: bad exercise specs: {err}");
                 return;
             }
         };
+        let (camera_index, camera_rotate) = detector::env_camera();
+        let mut consensus_cameras = None;
         let Some((plugin_id, mut config)) =
-            metric_config_for(&specs, &exercise, target_reps, target_seconds)
+            detector::metric_config_for(&specs, &exercise, target_reps, target_seconds, camera_index, camera_rotate)
         else {
             eprintln!("hub: no spec for exercise {exercise}; honor mode");
             queue_event(
@@ -658,13 +503,13 @@ pub fn enable_metric_async(app: &AppHandle, exercise: String, target_reps: u32, 
             return;
         };
 
-        match load_camera_settings(&app.state::<crate::Runtime>().normal_home) {
+        match detector::load_camera_settings(&app.state::<crate::Runtime>().normal_home) {
             Ok(Some(settings)) if settings.consensus && config.get("movementId").is_some() => {
                 // Require an active version: legacy exercise fallback has no cycle evidence.
                 if let Some(object) = config.as_object_mut() { object.remove("exercise"); }
                 let phone_source = match std::env::var("REPS_PHONE_URL_FILE") {
                     Ok(path) => match std::fs::read_to_string(path) {
-                        Ok(value) if phone_stream_url(value.trim()) => value.trim().to_string(),
+                        Ok(value) if detector::phone_stream_url(value.trim()) => value.trim().to_string(),
                         _ => { let _ = app.emit("vision-fallback", serde_json::json!({"reason": "Cannot read phone stream credentials file"})); return; }
                     },
                     Err(_) => settings.phone_url.clone(),
@@ -673,12 +518,12 @@ pub fn enable_metric_async(app: &AppHandle, exercise: String, target_reps: u32, 
                 let calibration: serde_json::Value = std::fs::read(calibration_path).ok()
                     .and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or(serde_json::json!({}));
                 config["cameraCalibration"] = calibration;
-                specs["cameras"] = serde_json::json!({ "set": ["webcam", "phone"],
+                consensus_cameras = Some(serde_json::json!({ "set": ["webcam", "phone"],
                     "fusion": {"policy": "consensus", "quorum": 2},
                     "registry": [
                         {"cameraId": "webcam", "label": "USB webcam", "kind": "usb", "transport": "direct", "source": settings.usb_device, "rotate": settings.usb_rotation},
                         {"cameraId": "phone", "label": "Android phone", "kind": "rtsp", "transport": "direct", "source": phone_source, "rotate": settings.phone_rotation}
-                    ] });
+                    ] }));
             }
             Ok(Some(settings)) => {
                 config["camera"]["source"] = serde_json::json!("uri");
@@ -692,7 +537,7 @@ pub fn enable_metric_async(app: &AppHandle, exercise: String, target_reps: u32, 
             }
         }
         config["appId"] = serde_json::json!(APP_ID);
-        let camera_set = apply_camera_set(&specs, &mut config);
+        let camera_set = detector::apply_camera_set(consensus_cameras.as_ref().or_else(|| specs.get("cameras")), &mut config);
         let state = app.state::<SharedHub>();
         let mut guard = state.lock().unwrap();
         if app.state::<crate::Runtime>().is_stopping() ||
@@ -790,64 +635,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shipped_specs_parse_and_declare_the_model() {
-        let specs = load_exercise_specs().unwrap();
-        assert_eq!(specs["model"]["plugin"], "reps_vision");
-        assert_eq!(specs["model"]["name"], "mediapipe-pose-landmarker");
-        assert!(specs["exercises"].get("squat").is_some());
-    }
-
-    #[test]
-    fn metric_config_carries_exercise_target_and_camera() {
-        let specs = load_exercise_specs().unwrap();
-        let (plugin, config) = metric_config_for(&specs, "squat", 12, 0.0).unwrap();
-        assert_eq!(plugin, "reps_vision");
-        assert_eq!(config["activity"], "lift");
-        // downBelow is the (camera-tuned) spec value, not a hardcoded constant.
-        assert_eq!(
-            config["exercise"]["downBelow"],
-            specs["exercises"]["squat"]["exercise"]["downBelow"]
-        );
-        assert!(config["exercise"]["downBelow"].is_number());
-        assert_eq!(config["targetReps"], 12);
-        assert_eq!(config["movementId"], "squat");
-        assert_eq!(config["camera"]["source"], "index");
-        assert_eq!(config["camera"]["id"], "webcam");
-        // The rig is mounted 180°; frames must be rotated to match the tuned
-        // thresholds (env REPS_CAMERA_ROTATE overrides; default 180).
-        let expected_rotate: i64 = std::env::var("REPS_CAMERA_ROTATE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(180);
-        assert_eq!(config["camera"]["rotate"], expected_rotate);
-    }
-
-    #[test]
-    fn camera_set_spec_overrides_single_camera_config() {
-        let specs = serde_json::json!({
-            "model": {"plugin": "reps_vision"},
-            "cameras": {
-                "registry": [
-                    {"cameraId": "front", "kind": "usb", "source": "v4l2:///dev/video0"},
-                    {"cameraId": "side", "kind": "usb", "source": "v4l2:///dev/video1"}
-                ],
-                "set": ["front", "side"],
-                "fusion": {"policy": "best", "scoreField": "visibility"}
-            },
-            "exercises": {"squat": {"activity": "lift",
-                "exercise": {"name": "squat", "joints": ["hip","knee","ankle"],
-                              "downBelow": 110.0, "upAbove": 160.0}}}
-        });
-        let (_, mut config) = metric_config_for(&specs, "squat", 5, 0.0).unwrap();
-        let set = apply_camera_set(&specs, &mut config).unwrap();
-        assert_eq!(set.cameras, vec!["front", "side"]);
-        assert_eq!(set.registry.len(), 2);
-        // exclusive with the injected single-camera object
-        assert!(config.get("camera").is_none());
-        assert_eq!(config["fusion"]["scoreField"], "visibility");
-    }
-
-    #[test]
     fn enable_on_hub_registers_cameras_then_enables_then_applies_overlays() {
         let specs = serde_json::json!({
             "model": {"plugin": "reps_vision"},
@@ -864,20 +651,17 @@ mod tests {
                 "exercise": {"name": "squat", "joints": ["hip","knee","ankle"],
                               "downBelow": 110.0, "upAbove": 160.0}}}
         });
-        let (plugin_id, mut config) = metric_config_for(&specs, "squat", 5, 0.0).unwrap();
-        let camera_set = apply_camera_set(&specs, &mut config);
+        let inputs = detector::DetectorInputs {
+            specs,
+            settings: Ok(None),
+            phone_url_override: None,
+            calibration: serde_json::json!({}),
+            camera_index: 0,
+            camera_rotate: None,
+        };
+        let (request, camera_set) = detector::detector_request(&inputs, "squat", 5, 0.0).unwrap();
         let mut hub = hub_client::fake::FakeHub::new(vec![]);
-        enable_on_hub(
-            &mut hub,
-            &camera_set,
-            &EnableMetric {
-                metric_id: WORKOUT_METRIC.into(),
-                plugin_id,
-                cameras: camera_set.as_ref().map(|set| set.cameras.clone()),
-                config,
-            },
-        )
-        .unwrap();
+        enable_on_hub(&mut hub, &camera_set, &request).unwrap();
         // stale-stream teardown first, then registration, enable, overlays
         assert_eq!(
             hub.calls,
@@ -889,39 +673,6 @@ mod tests {
                 format!("update:{WORKOUT_METRIC}:side"),
             ]
         );
-    }
-
-    #[test]
-    fn no_camera_set_leaves_single_camera_config_alone() {
-        let specs = load_exercise_specs().unwrap();
-        let (_, mut config) = metric_config_for(&specs, "squat", 5, 0.0).unwrap();
-        assert!(apply_camera_set(&specs, &mut config).is_none());
-        assert_eq!(config["camera"]["id"], "webcam");
-    }
-
-    #[test]
-    fn metric_config_sets_duration_targets_for_continuous() {
-        let specs = load_exercise_specs().unwrap();
-        let (_, config) = metric_config_for(&specs, "jumprope", 0, 90.0).unwrap();
-        assert_eq!(config["activity"], "jumprope");
-        assert_eq!(config["targetSeconds"], 90.0);
-    }
-
-    #[test]
-    fn unknown_exercise_yields_none() {
-        let specs = load_exercise_specs().unwrap();
-        assert!(metric_config_for(&specs, "wallsit", 0, 30.0).is_none());
-    }
-
-    #[test]
-    fn custom_repetition_movement_requires_an_active_hub_version() {
-        let specs = load_exercise_specs().unwrap();
-        let (plugin, config) = metric_config_for(&specs, "my-curl", 8, 0.0).unwrap();
-        assert_eq!(plugin, "reps_vision");
-        assert_eq!(config["movementId"], "my-curl");
-        assert_eq!(config["targetReps"], 8);
-        assert!(config.get("exercise").is_none());
-        assert!(metric_config_for(&specs, "", 8, 0.0).is_none());
     }
 
     #[test]

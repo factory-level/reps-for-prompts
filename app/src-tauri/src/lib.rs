@@ -36,6 +36,7 @@ struct PlanState {
 }
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
 
+mod detector;
 mod hub;
 mod windows;
 mod runtime;
@@ -235,23 +236,9 @@ fn emergency_escape(app: AppHandle, state: State<SharedCore>) -> Snapshot {
     snap
 }
 
-fn debug_exercise_options() -> Result<Vec<Prescription>, String> {
-    let specs = hub::load_exercise_specs()?;
-    let exercises = specs["exercises"].as_object().ok_or("Missing exercise specifications")?;
-    Ok(exercises.iter().map(|(name, spec)| {
-        let seconds = match spec["activity"].as_str() {
-            Some("jumprope") => spec["targetSeconds"].as_f64().unwrap_or(60.0),
-            Some("stretch") => spec["holdSeconds"].as_f64().unwrap_or(30.0),
-            _ => 0.0,
-        };
-        Prescription { exercise: name.clone(), kind: if seconds > 0.0 { ExerciseKind::Continuous } else { ExerciseKind::Rep },
-            target_reps: if seconds > 0.0 { 0 } else { 10 }, target_seconds: seconds, default_weight: 0.0 }
-    }).collect())
-}
-
 fn debug_exercises(app: AppHandle) -> Result<Vec<Prescription>, String> {
     app.state::<Runtime>().require_debug()?;
-    debug_exercise_options()
+    detector::debug_exercise_options()
 }
 
 /// DEBUG: force the session between "coding" and "workout" without waiting out
@@ -261,7 +248,7 @@ fn debug_mode(app: AppHandle, state: State<SharedCore>, mode: String, exercise: 
     app.state::<Runtime>().require_debug()?;
     if mode != "workout" && mode != "coding" { return Err("Unknown test action".into()); }
     let selected = if mode == "workout" {
-        exercise.map(|name| debug_exercise_options()?.into_iter().find(|rx| rx.exercise == name)
+        exercise.map(|name| detector::debug_exercise_options()?.into_iter().find(|rx| rx.exercise == name)
             .ok_or_else(|| format!("Unknown exercise: {name}"))).transpose()?
     } else { None };
     stop_debug_process(&app);
@@ -421,7 +408,6 @@ type SharedDebugProcess = Mutex<DebugProcess>;
 
 const DEBUG_STREAM_EVENT: &str = "debug-stream";
 const DEBUG_JPEG_EVERY: &str = "5";
-const DEBUG_TARGET: &str = "10"; // matches WorkoutEngine's default_reps
 
 /// Decide whether a just-spawned child belonging to `my_generation` should be
 /// stored in `DebugProcess`, given the guard's generation at the moment the
@@ -478,7 +464,7 @@ fn debug_stream_start(
     let mut command = Command::new(python);
     command.args([
         "-m", "reps_vision.stream", "--video", &video, "--exercise", &exercise,
-        "--jpeg-every", DEBUG_JPEG_EVERY, "--target", DEBUG_TARGET,
+        "--jpeg-every", DEBUG_JPEG_EVERY, "--target", &detector::DEBUG_TARGET_REPS.to_string(),
     ]).current_dir(&vision_dir).env("PYTHONPATH", plugin_dir).env("PYTHONDONTWRITEBYTECODE", "1");
     if let Some(model) = model { command.env("REPS_POSE_MODEL", model); }
     let mut child = command
@@ -759,15 +745,15 @@ mod debug_view_tests {
     use super::*;
     #[test]
     fn selectable_exercises_cover_every_shipped_detector_with_correct_units() {
-        let options = debug_exercise_options().unwrap();
-        let specs = hub::load_exercise_specs().unwrap();
+        let options = detector::debug_exercise_options().unwrap();
+        let specs = detector::load_exercise_specs().unwrap();
         assert_eq!(options.len(), specs["exercises"].as_object().unwrap().len());
         for rx in options {
             assert!(specs["exercises"].get(&rx.exercise).is_some());
             match rx.exercise.as_str() {
                 "jumprope" => { assert_eq!(rx.kind, ExerciseKind::Continuous); assert_eq!(rx.target_seconds, 60.0); }
                 "stretch" => { assert_eq!(rx.kind, ExerciseKind::Continuous); assert_eq!(rx.target_seconds, 30.0); }
-                _ => { assert_eq!(rx.kind, ExerciseKind::Rep); assert_eq!(rx.target_reps, 10); }
+                _ => { assert_eq!(rx.kind, ExerciseKind::Rep); assert_eq!(rx.target_reps, detector::DEBUG_TARGET_REPS); }
             }
         }
     }
