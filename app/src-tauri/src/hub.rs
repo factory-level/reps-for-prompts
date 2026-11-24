@@ -337,7 +337,7 @@ fn pump_events(app: AppHandle, rx: std::sync::mpsc::Receiver<VisionEvent>) {
             }
             VisionEvent::Landmarks(data) => print_detect(&data),
             VisionEvent::Progress { value, unit, satisfied, context } => {
-                if !life.detector_active() || crate::control::preview_only(&app) { continue; }
+                if !life.detector_active() || life.previewing() { continue; }
                 if !context.belongs_to(WORKOUT_METRIC, life.session_id().as_deref()) {
                     continue;
                 }

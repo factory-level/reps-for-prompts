@@ -180,7 +180,7 @@ impl lifecycle::Effects for TauriEffects {
 /// (fire-and-forget; failure surfaces honor mode).
 fn enable_metric_for(life: &Lifecycle, snap: &Snapshot) {
     if let Some(rx) = snap.prescription.as_ref() {
-        life.enable(rx.exercise.clone(), rx.target_reps, rx.target_seconds);
+        life.enable(rx.exercise.clone(), rx.target_reps, rx.target_seconds, false);
     }
 }
 
@@ -614,13 +614,13 @@ pub fn run() {
                     let poll_due = now - last_poll >= 5.;
                     if poll_due { daily::refresh(&mut daily); last_poll = now; }
                     let elapsed = (now - previous).max(0.); previous = now;
-                    core.session.defer_timer(engine::activity::excluded_elapsed(elapsed, daily.agents.active() && !control::preview_only(&handle), daily.snooze_until > now));
+                    core.session.defer_timer(engine::activity::excluded_elapsed(elapsed, daily.agents.active() && !state.previewing(), daily.snooze_until > now));
                     if daily.snooze_until > 0. && daily.snooze_until <= now {
                         daily.snooze_until = 0.;
                         let _ = core.store.set_setting("snooze_until", "0");
                         core.session.configure_timer(0., now);
                     }
-                    let can_remind = daily.agents.active() && daily.snooze_until <= now && !control::preview_only(&handle);
+                    let can_remind = daily.agents.active() && daily.snooze_until <= now && !state.previewing();
                     drop(daily);
                     if poll_due {if let Some(plan)=core.session.plan(){let day=plan.to_day_plan();let _=core.store.record_routine_day(plan.date(),day.sets_done,day.sets_total);}}
                     let before = core.session.snapshot(now);

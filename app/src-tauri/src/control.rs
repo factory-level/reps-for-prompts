@@ -11,7 +11,6 @@ impl Default for DisplayState{fn default()->Self{Self{notice:None,view:"screen".
 pub type SharedDisplay=std::sync::Mutex<DisplayState>;
 #[tauri::command]
 pub fn get_display_state(app:AppHandle)->DisplayState {app.state::<SharedDisplay>().lock().unwrap().clone()}
-pub fn preview_only(app:&AppHandle)->bool{app.state::<SharedDisplay>().lock().unwrap().preview_only}
 pub fn error(app:&AppHandle,message:String){app.state::<SharedDisplay>().lock().unwrap().last_error=Some(message);}
 /// The camera/vision path changed state: tell the windows.
 pub fn vision(app:&AppHandle,status:crate::vision_status::VisionStatus){let state={let state=app.state::<SharedDisplay>();let mut s=state.lock().unwrap();s.vision=status;s.clone()};let _=app.emit("display-state",state);}
@@ -21,7 +20,7 @@ fn view(app:&AppHandle,name:&str,preview:bool){
  let state={let state=app.state::<SharedDisplay>();let mut s=state.lock().unwrap();s.view=name.into();s.preview_only=preview;s.last_error=None;s.frames_seen=0;s.clone()};
  let _=app.emit("display-state",state);
 }
-fn stop_preview(app:&AppHandle){if preview_only(app){app.state::<Lifecycle>().release_camera();}view(app,"screen",false);}
+fn stop_preview(app:&AppHandle){app.state::<Lifecycle>().preview_off();view(app,"screen",false);}
 fn show(app:&AppHandle){if let Some(w)=app.get_webview_window("main"){let _=w.show();let _=w.unminimize();}}
 fn dispatch(app:&AppHandle, command:Command)->Result<serde_json::Value,String>{
  command.validate()?;
@@ -52,19 +51,13 @@ fn dispatch(app:&AppHandle, command:Command)->Result<serde_json::Value,String>{
     "settings"=>return serde_json::to_value(crate::detector::load_camera_settings(&app.state::<Runtime>().normal_home)?.unwrap_or_default()).map_err(|e|e.to_string()),
     "set"=>{
      let phase=app.state::<Lifecycle>().snapshot().phase;
-     if phase!=Phase::Coding||preview_only(app){return Err("Stop preview/workout before changing cameras".into());}
+     if phase!=Phase::Coding||app.state::<Lifecycle>().previewing(){return Err("Stop preview/workout before changing cameras".into());}
      let mut current=serde_json::to_value(crate::detector::load_camera_settings(&app.state::<Runtime>().normal_home)?.unwrap_or_default()).map_err(|e|e.to_string())?;
      for (k,v) in settings.as_ref().and_then(|v|v.as_object()).ok_or("Camera settings must be an object")?{current[k]=v.clone();}
      crate::hub::save_camera_settings(app.clone(),serde_json::from_value(current).map_err(|e|e.to_string())?)?;
      return serde_json::to_value(crate::detector::load_camera_settings(&app.state::<Runtime>().normal_home)?.unwrap_or_default()).map_err(|e|e.to_string());
     },
-    "preview"=>{
-     let phase=app.state::<Lifecycle>().snapshot().phase;
-     if !matches!(phase,Phase::Coding|Phase::WorkoutActive){return Err("Finish, skip, or cancel the current break before starting camera preview".into());}
-     let preview=phase==Phase::Coding;
-     view(app,"camera",preview);show(app);
-     if preview{app.state::<Lifecycle>().enable("squat".into(),100000,0.);}
-    },
+    "preview"=>{let preview=app.state::<Lifecycle>().preview_on()?;view(app,"camera",preview);show(app);},
     "stop"=>stop_preview(app),
     "status"=>{
      let state=app.state::<crate::hub::SharedHub>();let mut hub=state.lock().unwrap();
@@ -99,10 +92,10 @@ fn dispatch(app:&AppHandle, command:Command)->Result<serde_json::Value,String>{
    if let Some(on)=visible{if on{w.show()}else{w.hide()}.map_err(|e|e.to_string())?;}
    return Ok(serde_json::json!({"window":window,"monitors":monitors.iter().enumerate().map(|(i,m)|serde_json::json!({"index":i,"name":m.name(),"width":m.size().width,"height":m.size().height})).collect::<Vec<_>>()}));
   },
-  Command::Start=>{stop_preview(app);daily::reminder_action(app.clone(),"start".into(),None)?;if let Some(w)=app.get_webview_window("main"){let _=w.show();let _=w.unminimize();}},
+  Command::Start=>{view(app,"screen",false);daily::reminder_action(app.clone(),"start".into(),None)?;if let Some(w)=app.get_webview_window("main"){let _=w.show();let _=w.unminimize();}},
   Command::Snooze{minutes}=>daily::reminder_action(app.clone(),"snooze".into(),Some(minutes))?,
   Command::Skip=>daily::reminder_action(app.clone(),"skip".into(),None)?,
-  Command::Cancel=>{stop_preview(app);crate::stop_debug_process(app);app.state::<Lifecycle>().cancel();},
+  Command::Cancel=>{view(app,"screen",false);crate::stop_debug_process(app);app.state::<Lifecycle>().cancel();},
   Command::Finish{weight,honor}=>{app.state::<Lifecycle>().finish(weight,honor)?;},
   Command::Settings{minutes,lock_mode}=>{
    if lock_mode==Some(true){return Err("CLI-only displays cannot take over the terminal; lock mode must stay off".into());}

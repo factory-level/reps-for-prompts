@@ -41,6 +41,8 @@ struct Gate {
     generation: u64,
     /// The detector was asked to run and has not been turned off or failed.
     active: bool,
+    /// The detector runs only to show the camera: its frames count for nothing.
+    preview: bool,
 }
 
 #[derive(Clone)]
@@ -103,6 +105,11 @@ impl Lifecycle {
         self.core().session.snapshot(self.clock.now())
     }
 
+    /// The camera is on as a preview, outside any set.
+    pub fn previewing(&self) -> bool {
+        self.gate.lock().unwrap().preview
+    }
+
     pub fn vision_status(&self) -> VisionStatus {
         self.vision.lock().unwrap().status()
     }
@@ -138,7 +145,7 @@ impl Lifecycle {
         let left_active = was_active && snapshot.phase != Phase::WorkoutActive;
         if facts.contains(&Fact::Started) {
             if let Some(rx) = &snapshot.prescription {
-                self.enable(rx.exercise.clone(), rx.target_reps, rx.target_seconds);
+                self.enable(rx.exercise.clone(), rx.target_reps, rx.target_seconds, false);
             }
         } else if left_active
             || facts.iter().any(|fact| matches!(fact, Fact::Completed | Fact::Released(_) | Fact::CodingStarted))
@@ -169,6 +176,7 @@ impl Lifecycle {
     /// Start the set that is owed: the one the lock prescribed, or — early,
     /// while coding — the next one of the day.
     pub fn start(&self) -> Result<Snapshot, String> {
+        self.preview_off();
         if self.debug { return Err("Switch to Workout mode first".into()); }
         self.step(|core, now, today| {
             let phase = core.session.snapshot(now).phase;
@@ -233,11 +241,30 @@ impl Lifecycle {
     /// Leave the lock cycle without credit and go back to coding. The
     /// emergency escape: available in every phase, never rejected.
     pub fn cancel(&self) -> Snapshot {
+        self.preview_off();
         self.step(|core, now, _| {
             let facts = core.session.release(Release::Cancel, now);
             core.session.configure_timer(work_minutes(core), now);
             Ok(facts)
         }).unwrap_or_else(|_| self.snapshot())
+    }
+
+    /// Show the camera. While coding that means running the detector as a
+    /// preview (returns true); during a set the detector is already on.
+    pub fn preview_on(&self) -> Result<bool, String> {
+        let core = self.core();
+        let phase = core.session.snapshot(self.clock.now()).phase;
+        if !matches!(phase, Phase::Coding | Phase::WorkoutActive) {
+            return Err("Finish, skip, or cancel the current break before starting camera preview".into());
+        }
+        let preview = phase == Phase::Coding;
+        if preview { self.enable("squat".into(), 100000, 0., true); }
+        Ok(preview)
+    }
+
+    /// End a preview and release its camera. A set's detector is not touched.
+    pub fn preview_off(&self) {
+        if self.previewing() { self.release_camera(); }
     }
 
     pub(crate) fn persist(&self, core: &mut Core) -> Snapshot {
@@ -310,12 +337,18 @@ impl Lifecycle {
 
     /// Ask the hub to run the detector for a prescription. Fire-and-forget; a
     /// failure signals the vision status so the UI offers honor mode.
-    pub(crate) fn enable(&self, exercise: String, target_reps: u32, target_seconds: f64) {
+    /// A preview runs under a session id of its own that is never the
+    /// workout's, so none of its frames can count toward a set.
+    pub(crate) fn enable(&self, exercise: String, target_reps: u32, target_seconds: f64, preview: bool) {
         let (generation, session) = {
             let mut gate = self.gate.lock().unwrap();
             gate.generation += 1;
-            if self.debug || gate.session_id.is_none() { gate.session_id = Some(new_session_id()); }
-            (gate.generation, gate.session_id.clone().unwrap_or_default())
+            gate.preview = preview;
+            let session = if preview { new_session_id() } else {
+                if self.debug || gate.session_id.is_none() { gate.session_id = Some(new_session_id()); }
+                gate.session_id.clone().unwrap_or_default()
+            };
+            (gate.generation, session)
         };
         let this = self.clone();
         self.run(move || this.enable_now(generation, &session, &exercise, target_reps, target_seconds));
@@ -376,6 +409,7 @@ impl Lifecycle {
         let mut gate = self.gate.lock().unwrap();
         gate.generation += 1;
         gate.active = false;
+        gate.preview = false;
         self.signal(Signal::DetectorOff);
         (gate.generation, gate.session_id.clone())
     }
@@ -686,5 +720,47 @@ mod tests {
         }
         assert_eq!(rig.wire().len(), published);
         assert!(rig.active());
+    }
+
+    #[test]
+    fn a_preview_runs_under_its_own_session_and_start_takes_the_camera_over() {
+        let rig = rig(LIFTS, Some(FakeHub::new(vec![])), false);
+        assert_eq!(rig.life.preview_on(), Ok(true));
+        assert!(rig.life.previewing() && rig.active());
+        let preview_session = rig.wire()[0].1.clone();
+        assert_eq!(rig.types(), ["detector_started"]);
+        assert!(preview_session.is_some());
+        // The preview's id is not the session's: there is no session while coding.
+        assert!(rig.life.gate.lock().unwrap().session_id.is_none());
+
+        start(&rig);
+        assert!(!rig.life.previewing());
+        let session = rig.life.gate.lock().unwrap().session_id.clone();
+        assert!(session.is_some());
+        assert_ne!(session, preview_session);
+        assert!(rig.wire()[1..].iter().all(|(_, published)| *published == session));
+
+        // During a set the camera is already on: showing it enables nothing.
+        let calls = rig.calls().len();
+        assert_eq!(rig.life.preview_on(), Ok(false));
+        rig.life.preview_off();
+        assert_eq!(rig.calls().len(), calls);
+        assert!(rig.active());
+    }
+
+    #[test]
+    fn preview_off_releases_the_camera_and_a_lock_refuses_preview() {
+        let rig = rig(LIFTS, Some(FakeHub::new(vec![])), false);
+        rig.life.preview_on().unwrap();
+        rig.life.preview_off();
+        assert!(!rig.life.previewing() && !rig.active());
+        assert_eq!(rig.calls().last().unwrap(), "disable:workout");
+        assert_eq!(rig.types(), ["detector_started"]);
+
+        lock(&rig);
+        assert_eq!(
+            rig.life.preview_on().unwrap_err(),
+            "Finish, skip, or cancel the current break before starting camera preview",
+        );
     }
 }
