@@ -47,14 +47,14 @@ fn dispatch(app:&AppHandle, command:Command)->Result<serde_json::Value,String>{
      let mut cameras=Vec::new();if let Ok(entries)=std::fs::read_dir("/sys/class/video4linux"){for entry in entries.flatten(){cameras.push(serde_json::json!({"device":format!("/dev/{}",entry.file_name().to_string_lossy()),"name":std::fs::read_to_string(entry.path().join("name")).unwrap_or_default().trim()}));}}
      return Ok(serde_json::json!({"devices":cameras}));
     },
-    "settings"=>return serde_json::to_value(crate::hub::get_camera_settings(app.clone())?).map_err(|e|e.to_string()),
+    "settings"=>return serde_json::to_value(crate::detector::load_camera_settings(&app.state::<Runtime>().normal_home)?.unwrap_or_default()).map_err(|e|e.to_string()),
     "set"=>{
      let phase=app.state::<SharedCore>().lock().unwrap().session.snapshot(SystemClock.now()).phase;
      if phase!=Phase::Coding||preview_only(app){return Err("Stop preview/workout before changing cameras".into());}
-     let mut current=serde_json::to_value(crate::hub::get_camera_settings(app.clone())?).map_err(|e|e.to_string())?;
+     let mut current=serde_json::to_value(crate::detector::load_camera_settings(&app.state::<Runtime>().normal_home)?.unwrap_or_default()).map_err(|e|e.to_string())?;
      for (k,v) in settings.as_ref().and_then(|v|v.as_object()).ok_or("Camera settings must be an object")?{current[k]=v.clone();}
      crate::hub::save_camera_settings(app.clone(),serde_json::from_value(current).map_err(|e|e.to_string())?)?;
-     return serde_json::to_value(crate::hub::get_camera_settings(app.clone())?).map_err(|e|e.to_string());
+     return serde_json::to_value(crate::detector::load_camera_settings(&app.state::<Runtime>().normal_home)?.unwrap_or_default()).map_err(|e|e.to_string());
     },
     "preview"=>{
      let phase=app.state::<SharedCore>().lock().unwrap().session.snapshot(SystemClock.now()).phase;

@@ -5,7 +5,7 @@ Human instructions: [counting and tuning](../wiki/concepts/detection.md).
 
 ## Configuration precedence
 
-[hub.rs](../../app/src-tauri/src/hub.rs) embeds
+[detector.rs](../../app/src-tauri/src/detector.rs) embeds
 [exercise_specs.json](../../app/src-tauri/resources/exercise_specs.json) with Rust
 `include_str!`. Shipped lifts carry their legacy exercise config plus a movement
 ID. The hub resolves an active evaluated version for that ID when enabling the
