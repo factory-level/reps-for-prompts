@@ -54,9 +54,8 @@ NRestarts` is unchanged.
 
 ## Manual — real webcam and phone
 
-- [ ] Timer expires → **Start workout** → live skeleton, knee angle updates,
-      squats count into the session, reaching weight confirmation without
-      `simulate_progress`
+- [ ] Timer expires → `rfp start` → squats count into the session, reaching
+      weight confirmation without `rfp debug step`
 - [ ] Kill the hub mid-set (`pkill -f hubd.mjs`): one restart happens, the set
       continues
 - [ ] Kill it again: `rfp finish --honor` completes the set (there is no UI
