@@ -68,7 +68,8 @@ fn dispatch(app:&AppHandle, command:Command)->Result<serde_json::Value,String>{
     "stop"=>stop_preview(app),
     "status"=>{
      let state=app.state::<crate::hub::SharedHub>();let mut hub=state.lock().unwrap();
-     let health=hub.as_mut().ok_or_else(crate::hub::unavailable_reason)?.health().map_err(|e|e.to_string())?;
+     // No hub to ask: say why vision is unavailable rather than "starting" forever.
+     let health=hub.as_mut().ok_or_else(||match app.state::<crate::hub::SharedVision>().lock().unwrap().status(){crate::vision_status::VisionStatus::Unavailable{reason}=>reason,_=>"Vision hub is starting".into()})?.health().map_err(|e|e.to_string())?;
      return Ok(serde_json::json!({"visionHost":health.vision_host,"camera":health.camera,"enabledMetrics":health.enabled_metrics,"display":get_display_state(app.clone())}));
     },_=>unreachable!()
    }
