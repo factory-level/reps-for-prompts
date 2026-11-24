@@ -11,7 +11,7 @@ use engine::types::Progress;
 use hub_client::{EnableMetric, HubSupervisor, HubSupervisorConfig, VisionEvent, VisionHub};
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::detector::{self, CameraSet, CameraSettings};
+use crate::detector::{self, CameraSet, CameraSettings, HonorReason};
 
 pub const WORKOUT_METRIC: &str = "workout";
 pub const APP_ID: &str = "reps";
@@ -479,80 +479,44 @@ pub fn enable_metric_async(app: &AppHandle, exercise: String, target_reps: u32, 
     let app = app.clone();
     std::thread::spawn(move || {
         if app.state::<crate::Runtime>().is_stopping() { return; }
-        let specs = match detector::load_exercise_specs() {
-            Ok(specs) => specs,
-            Err(err) => {
+        let built = detector::load_inputs(&app.state::<crate::Runtime>().normal_home)
+            .and_then(|inputs| detector::detector_request(&inputs, &exercise, target_reps, target_seconds));
+        let (mut request, camera_set) = match built {
+            Ok(built) => built,
+            Err(HonorReason::BadSpecs(err)) => {
                 eprintln!("hub: bad exercise specs: {err}");
                 return;
             }
-        };
-        let (camera_index, camera_rotate) = detector::env_camera();
-        let mut consensus_cameras = None;
-        let Some((plugin_id, mut config)) =
-            detector::metric_config_for(&specs, &exercise, target_reps, target_seconds, camera_index, camera_rotate)
-        else {
-            eprintln!("hub: no spec for exercise {exercise}; honor mode");
-            queue_event(
-                "system_error",
-                serde_json::json!({"stage": "enable_metric", "error": format!("no spec for {exercise}")}),
-            );
-            let _ = app.emit(
-                "vision-fallback",
-                serde_json::json!({"reason": format!("no spec for {exercise}")}),
-            );
-            return;
-        };
-
-        match detector::load_camera_settings(&app.state::<crate::Runtime>().normal_home) {
-            Ok(Some(settings)) if settings.consensus && config.get("movementId").is_some() => {
-                // Require an active version: legacy exercise fallback has no cycle evidence.
-                if let Some(object) = config.as_object_mut() { object.remove("exercise"); }
-                let phone_source = match std::env::var("REPS_PHONE_URL_FILE") {
-                    Ok(path) => match std::fs::read_to_string(path) {
-                        Ok(value) if detector::phone_stream_url(value.trim()) => value.trim().to_string(),
-                        _ => { let _ = app.emit("vision-fallback", serde_json::json!({"reason": "Cannot read phone stream credentials file"})); return; }
-                    },
-                    Err(_) => settings.phone_url.clone(),
-                };
-                let calibration_path = app.state::<crate::Runtime>().normal_home.join("camera-calibration.json");
-                let calibration: serde_json::Value = std::fs::read(calibration_path).ok()
-                    .and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or(serde_json::json!({}));
-                config["cameraCalibration"] = calibration;
-                consensus_cameras = Some(serde_json::json!({ "set": ["webcam", "phone"],
-                    "fusion": {"policy": "consensus", "quorum": 2},
-                    "registry": [
-                        {"cameraId": "webcam", "label": "USB webcam", "kind": "usb", "transport": "direct", "source": settings.usb_device, "rotate": settings.usb_rotation},
-                        {"cameraId": "phone", "label": "Android phone", "kind": "rtsp", "transport": "direct", "source": phone_source, "rotate": settings.phone_rotation}
-                    ] }));
+            Err(HonorReason::NoSpec(exercise)) => {
+                eprintln!("hub: no spec for exercise {exercise}; honor mode");
+                queue_event(
+                    "system_error",
+                    serde_json::json!({"stage": "enable_metric", "error": format!("no spec for {exercise}")}),
+                );
+                let _ = app.emit(
+                    "vision-fallback",
+                    serde_json::json!({"reason": format!("no spec for {exercise}")}),
+                );
+                return;
             }
-            Ok(Some(settings)) => {
-                config["camera"]["source"] = serde_json::json!("uri");
-                config["camera"]["value"] = serde_json::json!(settings.usb_device);
-                config["camera"]["rotate"] = serde_json::json!(settings.usb_rotation);
+            Err(HonorReason::PhoneUrlInvalid) => {
+                let _ = app.emit("vision-fallback", serde_json::json!({"reason": "Cannot read phone stream credentials file"}));
+                return;
             }
-            Ok(None) => {}
-            Err(error) => {
+            Err(HonorReason::Settings(error)) => {
                 let _ = app.emit("vision-fallback", serde_json::json!({"reason": error}));
                 return;
             }
-        }
-        config["appId"] = serde_json::json!(APP_ID);
-        let camera_set = detector::apply_camera_set(consensus_cameras.as_ref().or_else(|| specs.get("cameras")), &mut config);
+        };
         let state = app.state::<SharedHub>();
         let mut guard = state.lock().unwrap();
         if app.state::<crate::Runtime>().is_stopping() ||
             app.state::<crate::Runtime>().detector_generation.load(std::sync::atomic::Ordering::SeqCst) != generation { return; }
         let sid = if app.state::<crate::Runtime>().is_debug() { new_session_id() } else { session_id().unwrap_or_else(new_session_id) };
-        config["sessionId"] = serde_json::json!(sid);
+        request.config["sessionId"] = serde_json::json!(sid);
         match guard.as_mut() {
             Some(hub) => {
                 DETECTOR_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
-                let request = EnableMetric {
-                    metric_id: WORKOUT_METRIC.into(),
-                    plugin_id,
-                    cameras: camera_set.as_ref().map(|set| set.cameras.clone()),
-                    config,
-                };
                 match enable_on_hub(hub.as_mut(), &camera_set, &request) {
                     Ok(()) => {
                         drop(guard);
