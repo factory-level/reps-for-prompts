@@ -7,7 +7,6 @@
     "gym"
   ],
   "permissions": [
-    "core:default",
-    "opener:default"
+    "core:default"
   ]
 }
