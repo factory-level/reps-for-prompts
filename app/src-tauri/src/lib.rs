@@ -591,95 +591,74 @@ pub fn run() {
             windows::place(app.handle());
             let handle = app.handle().clone();
             // The coding timer starts the moment the app does — no "start" button.
-            {
-                let clock = SystemClock;
-                let state = handle.state::<Lifecycle>();
-                if !handle.state::<Runtime>().is_debug() {
-                    state.publish_facts(&state.core().session.start(clock.now(), &clock.today()));
-                }
-            }
+            handle.state::<Lifecycle>().begin();
             std::thread::spawn(move || {
-                let mut unlocked_since: Option<f64> = None;
                 let mut previous = SystemClock.now();
                 let mut last_poll = 0.;
                 loop {
                     std::thread::sleep(Duration::from_secs(1));
                     let clock = SystemClock;
                     let (now, today) = (clock.now(), clock.today());
-                    let state = handle.state::<Lifecycle>();
-                    let mut core = state.core();
-                    if handle.state::<Runtime>().is_stopping() { break; }
-                    let daily_state = handle.state::<daily::SharedDaily>();
-                    let mut daily = daily_state.lock().unwrap();
+                    let life = handle.state::<Lifecycle>();
+                    let runtime = handle.state::<Runtime>();
+                    if runtime.is_stopping() { break; }
                     let poll_due = now - last_poll >= 5.;
-                    if poll_due { daily::refresh(&mut daily); last_poll = now; }
                     let elapsed = (now - previous).max(0.); previous = now;
-                    core.session.defer_timer(engine::activity::excluded_elapsed(elapsed, daily.agents.active() && !state.previewing(), daily.snooze_until > now));
-                    if daily.snooze_until > 0. && daily.snooze_until <= now {
-                        daily.snooze_until = 0.;
-                        let _ = core.store.set_setting("snooze_until", "0");
-                        core.session.configure_timer(0., now);
-                    }
-                    let can_remind = daily.agents.active() && daily.snooze_until <= now && !state.previewing();
-                    drop(daily);
-                    if poll_due {if let Some(plan)=core.session.plan(){let day=plan.to_day_plan();let _=core.store.record_routine_day(plan.date(),day.sets_done,day.sets_total);}}
-                    let before = core.session.snapshot(now);
-                    let remaining = before.day.as_ref().map(|d|d.sets_total.saturating_sub(d.sets_done)).unwrap_or(0);
-                    let end = reps_cli::workday::parse_time(&core.store.setting("workday_end","18:00")).unwrap_or(1080);
-                    let lead = core.store.setting("workday_warn_minutes","60").parse().unwrap_or(60);
-                    let warn = poll_due && reps_cli::workday::due(reps_cli::workday::local_minute(),end,lead,
-                        !handle.state::<Runtime>().is_debug() && can_remind && matches!(before.phase,Phase::Coding|Phase::ExerciseRequired),
-                        remaining,core.store.setting("last_day_warning","")==today);
-                    if warn && core.store.set_setting("last_day_warning",&today).is_ok() {
-                        let message=format!("Your workday is ending soon or has ended. {remaining} workout sets remain — you might miss today's routine. Start when ready: rfp start");
-                        let display={let state=handle.state::<control::SharedDisplay>();let mut display=state.lock().unwrap();display.notice=Some(message.clone());display.clone()};
-                        let _=handle.emit("display-state",display);
-                        daily::notify(message);
-                        if before.phase==Phase::Coding {core.session.configure_timer(0.,now);}
-                        if let Some(window)=handle.get_webview_window("main"){let _=window.show();let _=window.unminimize();}
-                    }
-                    // Clear a warning after starting a set or when the local date changes.
-                    if !matches!(before.phase,Phase::Coding|Phase::ExerciseRequired) || core.store.setting("last_day_warning","")!=today {
-                        let changed={let state=handle.state::<control::SharedDisplay>();let mut display=state.lock().unwrap();display.notice.take().map(|_|display.clone())};
-                        if let Some(display)=changed{let _=handle.emit("display-state",display);}
-                    }
-                    let locked = if !handle.state::<Runtime>().is_debug() && can_remind { core.session.tick(now, &today) } else { vec![] };
-                    let locked_now = !locked.is_empty();
-                    state.publish_facts(&locked);
-                    let mut snap = core.session.snapshot(now);
-                    if locked_now {
+                    let (defer, snooze_expired, can_remind) = {
+                        let daily_state = handle.state::<daily::SharedDaily>();
+                        let mut daily = daily_state.lock().unwrap();
+                        if poll_due { daily::refresh(&mut daily); last_poll = now; }
+                        let defer = engine::activity::excluded_elapsed(elapsed, daily.agents.active() && !life.previewing(), daily.snooze_until > now);
+                        let snooze_expired = daily.snooze_until > 0. && daily.snooze_until <= now;
+                        if snooze_expired { daily.snooze_until = 0.; }
+                        (defer, snooze_expired, daily.agents.active() && daily.snooze_until <= now && !life.previewing())
+                    };
+                    let before = life.snapshot();
+                    let warn = {
+                        let core = life.core();
+                        if snooze_expired { let _ = core.store.set_setting("snooze_until", "0"); }
+                        if poll_due {if let Some(plan)=core.session.plan(){let day=plan.to_day_plan();let _=core.store.record_routine_day(plan.date(),day.sets_done,day.sets_total);}}
+                        let remaining = before.day.as_ref().map(|d|d.sets_total.saturating_sub(d.sets_done)).unwrap_or(0);
+                        let end = reps_cli::workday::parse_time(&core.store.setting("workday_end","18:00")).unwrap_or(1080);
+                        let lead = core.store.setting("workday_warn_minutes","60").parse().unwrap_or(60);
+                        let warn = poll_due && reps_cli::workday::due(reps_cli::workday::local_minute(),end,lead,
+                            !runtime.is_debug() && can_remind && matches!(before.phase,Phase::Coding|Phase::ExerciseRequired),
+                            remaining,core.store.setting("last_day_warning","")==today);
+                        let warned = warn && core.store.set_setting("last_day_warning",&today).is_ok();
+                        // Clear a warning after starting a set or when the local date changes.
+                        let stale = !matches!(before.phase,Phase::Coding|Phase::ExerciseRequired) || core.store.setting("last_day_warning","")!=today;
+                        drop(core);
+                        if warned {
+                            let message=format!("Your workday is ending soon or has ended. {remaining} workout sets remain — you might miss today's routine. Start when ready: rfp start");
+                            let display={let state=handle.state::<control::SharedDisplay>();let mut display=state.lock().unwrap();display.notice=Some(message.clone());display.clone()};
+                            let _=handle.emit("display-state",display);
+                            daily::notify(message);
+                            if let Some(window)=handle.get_webview_window("main"){let _=window.show();let _=window.unminimize();}
+                        }
+                        if stale {
+                            let changed={let state=handle.state::<control::SharedDisplay>();let mut display=state.lock().unwrap();display.notice.take().map(|_|display.clone())};
+                            if let Some(display)=changed{let _=handle.emit("display-state",display);}
+                        }
+                        (warn, warned)
+                    };
+                    let (snap, locked) = life.tick(now, &today, lifecycle::Tick {
+                        defer,
+                        // A snooze ran out, or the workday warning asks for the set now.
+                        expire: snooze_expired || (warn.1 && before.phase == Phase::Coding),
+                        remind: can_remind,
+                        auto_start: runtime.enforces_windows(),
+                    });
+                    if locked {
                         // Show the passive reminder; CLI starts the camera.
-                        if !warn {daily::notify("Time for a little movement. Start your next workout from the terminal: rfp start".into());}
-                        state.emit(&snap);
-                        if handle.state::<Runtime>().enforces_windows() {
-                            state.publish_facts(&core.session.start_workout(&today));
-                            snap = state.persist(&mut core);
-                            enable_metric_for(&state, &snap);
-                        } else if let Some(window) = handle.get_webview_window("main") {
-                            let _ = window.show(); let _ = window.unminimize();
+                        if !warn.0 {daily::notify("Time for a little movement. Start your next workout from the terminal: rfp start".into());}
+                        if !runtime.enforces_windows() {
+                            if let Some(window) = handle.get_webview_window("main") { let _ = window.show(); let _ = window.unminimize(); }
                         }
-                    }
-                    // The "LOGGED" beat: 3s in UNLOCKED, then CODE (main minimizes).
-                    if !handle.state::<Runtime>().is_debug() && snap.phase == Phase::Unlocked {
-                        let since = *unlocked_since.get_or_insert(now);
-                        if now - since >= 3.0 {
-                            state.publish_facts(&core.session.resume_coding(now));
-                            let minutes = core.store.setting("work_minutes", "25").parse().unwrap_or(25.);
-                            core.session.configure_timer(minutes, now);
-                            snap = state.persist(&mut core);
-                            unlocked_since = None;
-                            // Belt and braces: an aborted workout must release the camera.
-                            state.disable();
-                        }
-                    } else {
-                        unlocked_since = None;
                     }
                     let presence = handle.state::<daily::SharedDaily>().lock().unwrap().agents.clone();
-                    let runtime_status = serde_json::json!({"pid":std::process::id(),"updatedAt":now,"agents":presence,"phase":snap.phase,"remainingSeconds":snap.remaining_seconds,"mode":handle.state::<Runtime>().mode,"lockMode":handle.state::<Runtime>().enforces_windows()});
-                    let status_home = &handle.state::<Runtime>().session_home;
+                    let runtime_status = serde_json::json!({"pid":std::process::id(),"updatedAt":now,"agents":presence,"phase":snap.phase,"remainingSeconds":snap.remaining_seconds,"mode":runtime.mode,"lockMode":runtime.enforces_windows()});
+                    let status_home = &runtime.session_home;
                     if poll_due && std::fs::write(status_home.join("status.json.tmp"), runtime_status.to_string()).is_ok() { let _ = std::fs::rename(status_home.join("status.json.tmp"), status_home.join("status.json")); }
-                    drop(core);
-                    state.emit(&snap);
                     windows::refocus(&handle);
                     windows::assert_gym(&handle);
                 }

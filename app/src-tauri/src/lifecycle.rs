@@ -44,6 +44,21 @@ struct Gate {
     active: bool,
     /// The detector runs only to show the camera: its frames count for nothing.
     preview: bool,
+    /// When the tick loop first saw the set complete (the "LOGGED" beat).
+    unlocked_since: Option<f64>,
+}
+
+/// What the tick loop works out before each tick.
+#[derive(Default)]
+pub struct Tick {
+    /// Seconds since the last tick that do not count as coding time.
+    pub defer: f64,
+    /// The coding period ends now: a snooze ran out, or the workday warning fired.
+    pub expire: bool,
+    /// Reminders may fire: an agent is at work and nothing is snoozed.
+    pub remind: bool,
+    /// Lock mode: a lock starts its set without waiting for `start`.
+    pub auto_start: bool,
 }
 
 #[derive(Clone)]
@@ -173,6 +188,43 @@ impl Lifecycle {
     }
 
     // ---- Entry points ------------------------------------------------------
+
+    /// The app is up: the coding timer starts now — there is no "start"
+    /// button. Debug mode stays idle until a debug set is started.
+    pub fn begin(&self) {
+        if !self.debug { let _ = self.step(|core, now, today| Ok(core.session.start(now, today))); }
+    }
+
+    /// Once a second: run the coding timer, lock when it expires, and return
+    /// to coding three seconds after a completed set. Returns the snapshot
+    /// and whether this tick locked.
+    pub fn tick(&self, now: f64, today: &str, tick: Tick) -> (Snapshot, bool) {
+        let mut core = self.core();
+        core.session.defer_timer(tick.defer);
+        if tick.expire { core.session.configure_timer(0., now); }
+        let mut facts = if !self.debug && tick.remind { core.session.tick(now, today) } else { vec![] };
+        let locked = !facts.is_empty();
+        if locked && tick.auto_start { facts.extend(core.session.start_workout(today)); }
+        // The "LOGGED" beat: 3s in UNLOCKED, then CODE.
+        let unlocked = !self.debug && core.session.snapshot(now).phase == Phase::Unlocked;
+        let beat_over = {
+            let mut gate = self.gate.lock().unwrap();
+            let since = if unlocked { Some(*gate.unlocked_since.get_or_insert(now)) } else { None };
+            let over = since.is_some_and(|since| now - since >= 3.0);
+            if over || !unlocked { gate.unlocked_since = None; }
+            over
+        };
+        if beat_over {
+            facts.extend(core.session.resume_coding(now));
+            let minutes = work_minutes(&core);
+            core.session.configure_timer(minutes, now);
+        }
+        // Most ticks change nothing durable: only the countdown moves.
+        let snapshot = if facts.is_empty() { core.session.snapshot(now) } else { self.apply(&mut core, now, false, &facts) };
+        drop(core);
+        self.effects.snapshot(&snapshot);
+        (snapshot, locked)
+    }
 
     /// Start the set that is owed: the one the lock prescribed, or — early,
     /// while coding — the next one of the day.
@@ -586,10 +638,17 @@ mod tests {
         rig.life.start().unwrap()
     }
 
+    /// Let `seconds` pass, then tick.
+    fn tick(rig: &Rig, seconds: f64, tick: Tick) -> (Snapshot, bool) {
+        rig.clock.0.lock().unwrap().advance(seconds);
+        rig.life.tick(rig.clock.now(), DAY, tick)
+    }
+
+    fn reminding() -> Tick { Tick { remind: true, ..Tick::default() } }
+
     /// Let the coding timer run out.
     fn lock(rig: &Rig) -> Snapshot {
-        rig.clock.0.lock().unwrap().advance(1500.0);
-        rig.life.step(|core, now, today| Ok(core.session.tick(now, today))).unwrap()
+        tick(rig, 1500.0, reminding()).0
     }
 
     /// A progress frame as the hub stamps it for `session`.
@@ -961,5 +1020,68 @@ mod tests {
         assert_eq!(rig.life.vision_status(), VisionStatus::Available);
         rig.life.progress(VisionEvent::ConnectionLost);
         assert_eq!(rig.life.vision_status(), VisionStatus::Unavailable { reason: "Vision hub connection lost".into() });
+    }
+
+    #[test]
+    fn the_coding_timer_locks_only_when_reminders_may_fire() {
+        let rig = rig(LIFTS, Some(FakeHub::new(vec![])), false);
+        assert_eq!(tick(&rig, 1499.0, reminding()), (rig.life.snapshot(), false));
+        // No agent at work, or snoozed: the expired timer waits.
+        assert!(!tick(&rig, 1.0, Tick::default()).1);
+        assert!(rig.types().is_empty());
+
+        let (snapshot, locked) = tick(&rig, 1.0, reminding());
+        assert!(locked);
+        assert_eq!(snapshot.phase, Phase::ExerciseRequired);
+        assert_eq!(snapshot.prescription.unwrap().exercise, "squat");
+        assert_eq!(rig.types(), LOCK);
+        // The lock waits for `start`: the camera stays off.
+        assert!(rig.calls().is_empty());
+        assert!(!tick(&rig, 1.0, reminding()).1);
+        assert_eq!(rig.effects.0.lock().unwrap().snapshots.len(), 4);
+    }
+
+    #[test]
+    fn deferred_time_does_not_count_and_an_expiry_locks_at_once() {
+        let rig = rig(LIFTS, None, false);
+        // The whole interval was spent away from coding.
+        assert!(!tick(&rig, 1500.0, Tick { defer: 1500.0, ..reminding() }).1);
+        assert_eq!(rig.life.snapshot().remaining_seconds, 1500.0);
+        assert!(tick(&rig, 1.0, Tick { expire: true, ..reminding() }).1);
+    }
+
+    #[test]
+    fn in_lock_mode_the_lock_starts_the_set() {
+        let rig = rig(LIFTS, Some(FakeHub::new(vec![])), false);
+        let (snapshot, locked) = tick(&rig, 1500.0, Tick { auto_start: true, ..reminding() });
+        assert!(locked);
+        assert_eq!(snapshot.phase, Phase::WorkoutActive);
+        assert!(rig.active());
+        assert_eq!(rig.types(), [&LOCK[..], &["detector_started"]].concat());
+    }
+
+    #[test]
+    fn three_seconds_after_a_completed_set_the_tick_returns_to_coding() {
+        let rig = rig(LIFTS, Some(FakeHub::new(vec![])), false);
+        lock(&rig);
+        start(&rig);
+        rig.life.finish(95.0, true).unwrap();
+        let session = session(&rig);
+        assert_eq!(tick(&rig, 1.0, reminding()).0.phase, Phase::Unlocked);
+        assert_eq!(tick(&rig, 2.0, reminding()).0.phase, Phase::Unlocked);
+        let (snapshot, locked) = tick(&rig, 1.0, reminding());
+        assert_eq!((snapshot.phase, snapshot.remaining_seconds, locked), (Phase::Coding, 1500.0, false));
+        // The return to coding closes the session it is recorded under.
+        assert_eq!(rig.wire().last().unwrap(), &("coding_period_started".to_string(), session));
+        assert!(self::session(&rig).is_none());
+        assert_eq!(rig.types().iter().filter(|event_type| *event_type == "detector_stopped").count(), 1);
+    }
+
+    #[test]
+    fn debug_mode_never_locks_and_publishes_nothing() {
+        let rig = rig(LIFTS, Some(FakeHub::new(vec![])), true);
+        assert!(!tick(&rig, 5000.0, reminding()).1);
+        assert_eq!(rig.life.snapshot().phase, Phase::Coding);
+        assert!(rig.types().is_empty());
     }
 }
