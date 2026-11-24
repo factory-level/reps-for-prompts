@@ -22,6 +22,7 @@ from ..activities.stretch import StretchActivity
 from ..exercises import ExerciseSpec
 from ..movement import MovementActivity, validate_movement
 from ..pose import MODEL_SHA256
+from .live_capture import Capture, LiveCapture
 from .stream_loop import StreamLoop
 
 MODEL = {
@@ -201,7 +202,6 @@ def _redact_camera(camera: dict) -> dict:
 def _cv2_capture(camera: dict):
     if camera.get("source") == "file":
         return _open_cv2_capture(camera)
-    from .live_capture import LiveCapture
     return LiveCapture(lambda: _open_cv2_capture(camera))
 
 
@@ -223,9 +223,11 @@ def _open_cv2_capture(camera: dict):
     return _Capture(capture, camera)
 
 
-class _Capture:
+class _Capture(Capture):
     def __init__(self, capture, camera):
         import cv2
+        import uuid
+        self.epoch = str(uuid.uuid4())
         self.capture = capture
         self.rotate = int(camera.get("rotate", 0))
         if self.rotate not in (0, 90, 180, 270):

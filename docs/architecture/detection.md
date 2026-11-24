@@ -76,6 +76,35 @@ visibility. It can also respond to unrelated vertical motion.
 [StretchActivity](../../vision/src/reps_vision/activities/stretch.py) is elapsed
 time, without posture verification. Its behavior is unchanged.
 
+## Stream loop interfaces
+
+[StreamLoop](../../vision/src/reps_vision/hub_plugin/stream_loop.py) reads frames,
+estimates pose, updates one activity and emits frames. It depends on two declared
+interfaces and does not probe its collaborators for attributes.
+
+`Capture` ([live_capture.py](../../vision/src/reps_vision/hub_plugin/live_capture.py)):
+`live`, `epoch`, `time_ms`, `read()`, `release()`, `timing_trusted()`. A failed
+read ends the stream for a file source (`live = False`) and is reported as
+`cameraStatus: disconnected` for a camera (`live = True`). `LiveCapture` changes
+`epoch` on every reopen; `timing_trusted()` turns false after a reconnect or a
+frame gap over 200 ms and stays false for the rest of that capture.
+
+`BreakActivity` ([base.py](../../vision/src/reps_vision/activities/base.py)):
+`unit`, `isotropic_landmarks`, `completed_cycle`, `diagnostics`, `update()`,
+`reset(reason)`. `unit` is known before the first frame, so a disconnect before
+any frame still reports seconds for jump rope and stretch. Only
+`MovementActivity` sets `isotropic_landmarks` (x scaled by frame aspect), reports
+cycles and diagnostics, and clears its in-flight cycle on `reset`; the count is
+kept. An epoch change calls `reset("camera_reconnected")`.
+
+One rule, `StreamLoop._timing_offset`, decides whether a frame's times can be
+used for [consensus](consensus.md). `timingEligible` is true exactly when it
+yields an offset, and `cycleEvidence` is attached only then. A live calibration
+needs finite non-negative `delayMs` and `uncertaintyMs`, a finite `validUntilMs`
+not yet passed, and a trusted capture. A missing or infinite `validUntilMs` is
+ineligible: calibration is a measurement with a 15-minute expiry, never a
+standing grant. A file source needs finite `offsetMs` and `uncertaintyMs`.
+
 ## Verification and limits
 
 For the preset change, 49 existing tests passed across `test_compound_lifts.py`,

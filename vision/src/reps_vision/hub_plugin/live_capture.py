@@ -6,9 +6,28 @@ measured delay/uncertainty calibration; reconnection invalidates that mapping.
 import threading
 import time
 import uuid
+from typing import Protocol
 
 
-class LiveCapture:
+class Capture(Protocol):
+    """What StreamLoop uses. Defaults describe a finite source (a file)."""
+
+    live: bool = False  # True: a failed read is a disconnect to wait out, not the end
+    epoch: str          # changes whenever the device is reopened
+    time_ms: float | None = None  # source time of the frame last returned by read()
+
+    def read(self) -> tuple[bool, object]: ...
+
+    def release(self) -> None: ...
+
+    def timing_trusted(self) -> bool:
+        """Can frame times still be mapped onto the calibrated clock?"""
+        return True
+
+
+class LiveCapture(Capture):
+    live = True
+
     def __init__(self, open_capture):
         self._open = open_capture
         self._capture = open_capture()
@@ -64,6 +83,12 @@ class LiveCapture:
             frame, self.time_ms = self._latest
             self._latest = None
             return True, frame
+
+    def timing_trusted(self):
+        # Both flags are sticky: a reconnect or a >200 ms gap voids the
+        # calibration for the rest of this capture; only a new stream
+        # (new calibration) restores it.
+        return not self.reconnected and not self.timing_invalidated
 
     def release(self):
         self._stop.set()
