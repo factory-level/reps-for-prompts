@@ -1,17 +1,22 @@
 //! Scripted in-memory hub for app-level tests: records calls, replays events.
 
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 
 use crate::{EnableMetric, HubError, HubHealth, VisionEvent, VisionHub};
 
 pub struct FakeHub {
-    pub calls: Vec<String>,
+    /// Shared, so a test can keep reading it after the hub is boxed away.
+    pub calls: Arc<Mutex<Vec<String>>>,
     /// Wire params of every publish_event/publish_command/report_action_result.
     pub published: Vec<serde_json::Value>,
     scripted: Vec<VisionEvent>,
     tx: mpsc::Sender<VisionEvent>,
     rx: Option<mpsc::Receiver<VisionEvent>>,
     pub fail_next: bool,
+    /// Fails the next `enable_metric` only — `fail_next` would be consumed by
+    /// the stale-stream disable that precedes every enable.
+    pub fail_next_enable: bool,
+    enabled: Vec<String>,
 }
 
 impl FakeHub {
@@ -19,18 +24,24 @@ impl FakeHub {
     pub fn new(scripted: Vec<VisionEvent>) -> Self {
         let (tx, rx) = mpsc::channel();
         FakeHub {
-            calls: vec![],
+            calls: Arc::default(),
             published: vec![],
             scripted,
             tx,
             rx: Some(rx),
             fail_next: false,
+            fail_next_enable: false,
+            enabled: vec![],
         }
     }
 
     /// Push an extra event mid-test.
     pub fn push(&self, event: VisionEvent) {
         let _ = self.tx.send(event);
+    }
+
+    fn log(&self, call: String) {
+        self.calls.lock().unwrap().push(call);
     }
 
     fn check_fail(&mut self) -> Result<(), HubError> {
@@ -44,9 +55,12 @@ impl FakeHub {
 
 impl VisionHub for FakeHub {
     fn enable_metric(&mut self, req: &EnableMetric) -> Result<(), HubError> {
+        if std::mem::take(&mut self.fail_next_enable) {
+            return Err(HubError::Down);
+        }
         self.check_fail()?;
-        self.calls
-            .push(format!("enable:{}:{}", req.metric_id, req.plugin_id));
+        self.log(format!("enable:{}:{}", req.metric_id, req.plugin_id));
+        self.enabled.push(req.metric_id.clone());
         for event in self.scripted.drain(..) {
             let _ = self.tx.send(event);
         }
@@ -55,7 +69,13 @@ impl VisionHub for FakeHub {
 
     fn disable_metric(&mut self, metric_id: &str) -> Result<(), HubError> {
         self.check_fail()?;
-        self.calls.push(format!("disable:{metric_id}"));
+        self.log(format!("disable:{metric_id}"));
+        // Like the hub: only an enabled metric can be disabled.
+        let before = self.enabled.len();
+        self.enabled.retain(|enabled| enabled != metric_id);
+        if self.enabled.len() == before {
+            return Err(HubError::Api(format!("unknown metric: {metric_id}")));
+        }
         Ok(())
     }
 
@@ -64,14 +84,14 @@ impl VisionHub for FakeHub {
         metric_id: &str,
         _config: &serde_json::Value,
     ) -> Result<(), HubError> {
-        self.calls.push(format!("update:{metric_id}"));
+        self.log(format!("update:{metric_id}"));
         Ok(())
     }
 
     fn add_camera(&mut self, camera: &serde_json::Value) -> Result<(), HubError> {
         self.check_fail()?;
         let id = camera["cameraId"].as_str().unwrap_or("?");
-        self.calls.push(format!("add_camera:{id}"));
+        self.log(format!("add_camera:{id}"));
         Ok(())
     }
 
@@ -82,12 +102,12 @@ impl VisionHub for FakeHub {
         _config: &serde_json::Value,
     ) -> Result<(), HubError> {
         self.check_fail()?;
-        self.calls.push(format!("update:{metric_id}:{camera_id}"));
+        self.log(format!("update:{metric_id}:{camera_id}"));
         Ok(())
     }
 
     fn simulate(&mut self, metric_id: &str, event: &serde_json::Value) -> Result<(), HubError> {
-        self.calls.push(format!("simulate:{metric_id}"));
+        self.log(format!("simulate:{metric_id}"));
         if let Some(converted) = crate::event_from_frame(&serde_json::json!({
             "stream": "event",
             "data": event,
@@ -116,14 +136,14 @@ impl VisionHub for FakeHub {
         _manifest: &serde_json::Value,
     ) -> Result<(), HubError> {
         self.check_fail()?;
-        self.calls.push(format!("register_application:{app_id}"));
+        self.log(format!("register_application:{app_id}"));
         Ok(())
     }
 
     fn publish_event(&mut self, params: &serde_json::Value) -> Result<(), HubError> {
         self.check_fail()?;
         let event_type = params["type"].as_str().unwrap_or("?");
-        self.calls.push(format!("publish_event:{event_type}"));
+        self.log(format!("publish_event:{event_type}"));
         self.published.push(params.clone());
         Ok(())
     }
@@ -131,7 +151,7 @@ impl VisionHub for FakeHub {
     fn publish_command(&mut self, params: &serde_json::Value) -> Result<(), HubError> {
         self.check_fail()?;
         let command_type = params["type"].as_str().unwrap_or("?");
-        self.calls.push(format!("publish_command:{command_type}"));
+        self.log(format!("publish_command:{command_type}"));
         self.published.push(params.clone());
         Ok(())
     }
@@ -139,7 +159,7 @@ impl VisionHub for FakeHub {
     fn report_action_result(&mut self, params: &serde_json::Value) -> Result<(), HubError> {
         self.check_fail()?;
         let result_type = params["type"].as_str().unwrap_or("?");
-        self.calls.push(format!("report_action_result:{result_type}"));
+        self.log(format!("report_action_result:{result_type}"));
         self.published.push(params.clone());
         Ok(())
     }

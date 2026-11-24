@@ -103,16 +103,7 @@ fn dispatch(app:&AppHandle, command:Command)->Result<serde_json::Value,String>{
   Command::Snooze{minutes}=>daily::reminder_action(app.clone(),"snooze".into(),Some(minutes))?,
   Command::Skip=>daily::reminder_action(app.clone(),"skip".into(),None)?,
   Command::Cancel=>{stop_preview(app);crate::stop_debug_process(app);crate::emergency_escape(app.clone(),app.state::<Lifecycle>());},
-  Command::Finish{weight,honor}=>{
-   let phase=app.state::<Lifecycle>().snapshot().phase;
-   if !matches!(phase,Phase::WorkoutActive|Phase::WeightConfirmation){return Err("No active workout to finish. Run: reps start".into());}
-   if phase==Phase::WorkoutActive {
-    if !honor{return Err("Target not yet detected. Use --honor only if you completed the prescribed set yourself".into());}
-    crate::hub::honor_complete(app)?;
-   }
-   let phase=app.state::<Lifecycle>().snapshot().phase;
-   if phase==Phase::WeightConfirmation {crate::confirm_weight(app.clone(),app.state::<Lifecycle>(),weight);}
-  },
+  Command::Finish{weight,honor}=>{app.state::<Lifecycle>().finish(weight,honor)?;},
   Command::Settings{minutes,lock_mode}=>{
    if lock_mode==Some(true){return Err("CLI-only displays cannot take over the terminal; lock mode must stay off".into());}
    let (current_minutes,current_lock)={let life=app.state::<Lifecycle>();let core=life.core();(core.store.setting("work_minutes","25").parse().unwrap_or(25),core.store.setting("lock_mode","0")=="1")};

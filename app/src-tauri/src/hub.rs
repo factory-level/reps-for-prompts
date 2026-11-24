@@ -371,22 +371,6 @@ fn pump_events(app: AppHandle, rx: std::sync::mpsc::Receiver<VisionEvent>) {
     }
 }
 
-/// Honor-mode completion: the camera path failed, the user pressed Done.
-pub fn honor_complete(app: &AppHandle) -> Result<engine::types::Snapshot, String> {
-    let life = app.state::<crate::Lifecycle>();
-    let mut core = life.core();
-    let facts = core.session.honor_complete();
-    if facts.is_empty() {
-        return Err("No active workout to complete".into());
-    }
-    life.publish_facts(&facts);
-    let snap = life.persist(&mut core);
-    drop(core);
-    life.emit(&snap);
-    life.disable();
-    Ok(snap)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,7 +406,7 @@ mod tests {
         enable_on_hub(&mut hub, &camera_set, &request).unwrap();
         // stale-stream teardown first, then registration, enable, overlays
         assert_eq!(
-            hub.calls,
+            *hub.calls.lock().unwrap(),
             vec![
                 format!("disable:{WORKOUT_METRIC}"),
                 "add_camera:front".to_string(),

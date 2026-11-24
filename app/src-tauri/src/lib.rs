@@ -277,22 +277,6 @@ fn simulate_progress(
     Ok(snap)
 }
 
-fn confirm_weight(_app: AppHandle, state: State<Lifecycle>, weight: f64) -> Snapshot {
-    let clock = SystemClock;
-    let mut core = state.core();
-    // persist_and_snapshot writes the pending record.
-    state.publish_facts(&core.session.confirm_weight(weight, &clock.today()));
-    let snap = state.persist(&mut core);
-    drop(core);
-    // Camera gating: confirming the weight ENDS the workout, so it must
-    // release the camera like every other completion path. Found live: a
-    // simulated/early completion left the detector running (and counting)
-    // after desktop_unlocked because only the hub-satisfied path disabled.
-    state.disable();
-    state.emit(&snap);
-    snap
-}
-
 // ---------------------------------------------------------------------------
 // Detection debug view (Task C): stream exercise fixture videos through the
 // Python detector sidecar for live visual debugging.

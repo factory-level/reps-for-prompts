@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use engine::clock::Clock;
 use engine::session::Fact;
-use engine::types::Snapshot;
+use engine::types::{Phase, Snapshot};
 use hub_client::outbox::Publication;
 use serde_json::{json, Value};
 
@@ -117,6 +117,67 @@ impl Lifecycle {
         gate.generation += 1;
         gate.active = false;
         gate.session_id = None;
+    }
+
+    // ---- The step ----------------------------------------------------------
+
+    /// What every transition causes, in one place: publish its facts, persist,
+    /// and gate the detector. The camera runs only while a set is under way —
+    /// `Started` turns it on; reaching the target, completing, releasing or
+    /// returning to coding turns it off. (Found live: a completion path that
+    /// turned the camera off by hand, and one that forgot to.)
+    fn apply(&self, core: &mut Core, now: f64, was_active: bool, facts: &[Fact]) -> Snapshot {
+        self.publish_facts(facts);
+        let snapshot = persist_and_snapshot(core, now);
+        // Honor completion and a satisfied target both leave WorkoutActive.
+        let left_active = was_active && snapshot.phase != Phase::WorkoutActive;
+        if facts.contains(&Fact::Started) {
+            if let Some(rx) = &snapshot.prescription {
+                self.enable(rx.exercise.clone(), rx.target_reps, rx.target_seconds);
+            }
+        } else if left_active
+            || facts.iter().any(|fact| matches!(fact, Fact::Completed | Fact::Released(_) | Fact::CodingStarted))
+        {
+            self.disable();
+        }
+        snapshot
+    }
+
+    /// Apply one session transition under the lock, then tell the windows.
+    /// `Err` from the transition means rejected: nothing else happens.
+    fn step(
+        &self,
+        transition: impl FnOnce(&mut Core, f64, &str) -> Result<Vec<Fact>, String>,
+    ) -> Result<Snapshot, String> {
+        let (now, today) = (self.clock.now(), self.clock.today());
+        let mut core = self.core();
+        let was_active = core.session.snapshot(now).phase == Phase::WorkoutActive;
+        let facts = transition(&mut core, now, &today)?;
+        let snapshot = self.apply(&mut core, now, was_active, &facts);
+        drop(core);
+        self.effects.snapshot(&snapshot);
+        Ok(snapshot)
+    }
+
+    // ---- Entry points ------------------------------------------------------
+
+    /// Complete the set: log the weight once the target was reached, or —
+    /// `honor` — attest a set the camera could not verify. Honor completion
+    /// always works during an active workout.
+    pub fn finish(&self, weight: f64, honor: bool) -> Result<Snapshot, String> {
+        self.step(|core, now, today| {
+            let phase = core.session.snapshot(now).phase;
+            if !matches!(phase, Phase::WorkoutActive | Phase::WeightConfirmation) {
+                return Err("No active workout to finish. Run: reps start".into());
+            }
+            if phase == Phase::WorkoutActive && !honor {
+                return Err("Target not yet detected. Use --honor only if you completed the prescribed set yourself".into());
+            }
+            // Each is a no-op outside its phase.
+            let mut facts = core.session.honor_complete();
+            facts.extend(core.session.confirm_weight(weight, today));
+            Ok(facts)
+        })
     }
 
     pub(crate) fn persist(&self, core: &mut Core) -> Snapshot {
@@ -312,4 +373,139 @@ pub(crate) fn persist_and_snapshot(core: &mut Core, now: f64) -> Snapshot {
         }
     }
     core.session.snapshot(now)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use engine::clock::FakeClock;
+    use engine::session::Session;
+    use engine::store::{default_continuous_pool, default_rotation, Store};
+    use engine::timer::CodingTimer;
+    use engine::workout::WorkoutEngine;
+    use hub_client::FakeHub;
+
+    const DAY: &str = "2026-11-23";
+    const LIFTS: &str = r#"{"lifts":[{"exercise":"squat","sets":3,"reps":5}]}"#;
+
+    #[derive(Default)]
+    struct Recorded {
+        snapshots: Vec<Snapshot>,
+        vision: Vec<VisionStatus>,
+        frames: usize,
+        published: Vec<Publication>,
+    }
+
+    #[derive(Clone, Default)]
+    struct Recording(Arc<Mutex<Recorded>>);
+
+    impl Effects for Recording {
+        fn snapshot(&self, snapshot: &Snapshot) { self.0.lock().unwrap().snapshots.push(snapshot.clone()); }
+        fn vision(&self, status: VisionStatus) { self.0.lock().unwrap().vision.push(status); }
+        fn camera_frame(&self, _camera_id: &str, _data: &Value) { self.0.lock().unwrap().frames += 1; }
+        fn publish(&self, publication: Publication) { self.0.lock().unwrap().published.push(publication); }
+    }
+
+    #[derive(Clone)]
+    struct SharedClock(Arc<Mutex<FakeClock>>);
+
+    impl Clock for SharedClock {
+        fn now(&self) -> f64 { self.0.lock().unwrap().now() }
+        fn today(&self) -> String { self.0.lock().unwrap().today() }
+    }
+
+    struct Rig {
+        life: Lifecycle,
+        effects: Recording,
+        /// The fake hub's call log; stays empty when the hub is absent.
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Rig {
+        /// (type, session id) of everything published, in order.
+        fn wire(&self) -> Vec<(String, Option<String>)> {
+            self.effects.0.lock().unwrap().published.iter().map(|publication| {
+                let (Publication::Event(p) | Publication::Command(p) | Publication::ActionResult(p)) = publication;
+                (p["type"].as_str().unwrap().to_string(), p["sessionId"].as_str().map(str::to_string))
+            }).collect()
+        }
+        fn types(&self) -> Vec<String> { self.wire().into_iter().map(|(event_type, _)| event_type).collect() }
+        fn calls(&self) -> Vec<String> { self.calls.lock().unwrap().clone() }
+        fn active(&self) -> bool { self.life.gate.lock().unwrap().active }
+        fn verified(&self) -> Vec<bool> {
+            self.life.core().store.history(10).unwrap().iter().map(|record| record.verified).collect()
+        }
+    }
+
+    fn rig(routine: &str, hub: Option<FakeHub>, debug: bool) -> Rig {
+        let mut session = Session::new(
+            CodingTimer::new(1500.0),
+            WorkoutEngine::new(default_rotation(), default_continuous_pool(), 20),
+        );
+        session.set_plan(engine::plan::DailyPlan::from_routine_json(routine, DAY).unwrap());
+        let core = Core { session, store: Store::open(std::path::Path::new(":memory:")).unwrap() };
+        let calls = hub.as_ref().map(|hub| hub.calls.clone()).unwrap_or_default();
+        let hub: SharedHub = Arc::new(Mutex::new(hub.map(|hub| Box::new(hub) as Box<dyn hub_client::VisionHub>)));
+        let effects = Recording::default();
+        let clock = SharedClock(Arc::new(Mutex::new(FakeClock::new(1000.0, DAY))));
+        let inputs: LoadInputs = Box::new(|| Ok(DetectorInputs {
+            specs: detector::load_exercise_specs().unwrap(),
+            settings: Ok(None),
+            phone_url_override: None,
+            calibration: json!({}),
+            camera_index: 0,
+            camera_rotate: None,
+        }));
+        let life = Lifecycle::new(core, Box::new(clock.clone()), hub, Box::new(effects.clone()), inputs, debug, true);
+        Rig { life, effects, calls }
+    }
+
+    fn start(rig: &Rig) -> Snapshot {
+        rig.life.step(|core, _, today| Ok(core.session.start_workout(today))).unwrap()
+    }
+
+    const LOCK: [&str; 5] = [
+        "coding_period_expired", "workout_prescribed",
+        "desktop.lock_requested", "desktop.lock_succeeded", "desktop_locked",
+    ];
+
+    #[test]
+    fn honor_finish_records_an_unverified_set_and_releases_the_camera() {
+        let rig = rig(LIFTS, Some(FakeHub::new(vec![])), false);
+        assert_eq!(start(&rig).phase, Phase::WorkoutActive);
+        assert!(rig.active());
+
+        let snapshot = rig.life.finish(95.0, true).unwrap();
+        assert_eq!(snapshot.phase, Phase::Unlocked);
+        assert_eq!(rig.verified(), vec![false]);
+        assert!(!rig.active());
+        assert_eq!(rig.calls().last().unwrap(), "disable:workout");
+        assert_eq!(rig.types(), [&LOCK[..], &[
+            "detector_started", "override_used", "weight_logged",
+            "workout_completed", "desktop_unlocked", "detector_stopped",
+        ]].concat());
+        // One session id on every event of the lock cycle.
+        let wire = rig.wire();
+        assert!(wire[0].1.is_some());
+        assert!(wire.iter().all(|(_, session)| *session == wire[0].1));
+        assert_eq!(rig.effects.0.lock().unwrap().snapshots.last().unwrap().phase, Phase::Unlocked);
+    }
+
+    #[test]
+    fn finishing_outside_an_active_workout_is_rejected_and_publishes_nothing() {
+        let rig = rig(LIFTS, Some(FakeHub::new(vec![])), false);
+        for honor in [false, true] {
+            assert_eq!(rig.life.finish(95.0, honor).unwrap_err(), "No active workout to finish. Run: reps start");
+        }
+        start(&rig);
+        let published = rig.wire().len();
+        assert_eq!(
+            rig.life.finish(95.0, false).unwrap_err(),
+            "Target not yet detected. Use --honor only if you completed the prescribed set yourself",
+        );
+        assert_eq!(rig.wire().len(), published);
+        assert_eq!(rig.verified(), Vec::<bool>::new());
+        assert!(rig.active());
+        assert_eq!(rig.life.snapshot().phase, Phase::WorkoutActive);
+    }
 }
