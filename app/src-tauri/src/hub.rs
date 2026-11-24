@@ -1,18 +1,18 @@
-//! Vision-hub integration: RFP declares its model and workout
-//! configs (resources/exercise_specs.json) and drives the bundled hub via
-//! the `VisionHub` trait — enable metric on workout start, pump events into
-//! the session, disable on completion. Honor-mode fallback when the hub is
-//! down: never strand the user, never phantom reps.
+//! Vision-hub integration: supervise the bundled hub, pump its events into
+//! the `Lifecycle`, and deliver the lifecycle's publications through the
+//! durable queue. What the hub is asked to do during a workout — enable the
+//! detector on start, disable it on completion, honor mode when the hub is
+//! down — is decided in `lifecycle.rs`.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use engine::session::{Fact, Release};
-use engine::types::Progress;
 use hub_client::{EnableMetric, HubSupervisor, HubSupervisorConfig, VisionEvent, VisionHub};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 
-use crate::detector::{self, CameraSet, CameraSettings, HonorReason};
-use crate::vision_status::{Signal, Vision};
+use crate::detector::{CameraSet, CameraSettings};
+use crate::vision_status::Signal;
+use crate::Lifecycle;
 
 pub const WORKOUT_METRIC: &str = "workout";
 pub const APP_ID: &str = "reps";
@@ -26,16 +26,11 @@ pub fn save_camera_settings(app: AppHandle, settings: CameraSettings) -> Result<
     std::fs::rename(temporary, path).map_err(|e| e.to_string())
 }
 
-pub type SharedHub = Mutex<Option<Box<dyn VisionHub>>>;
-pub type SharedVision = Mutex<Vision>;
+/// The slot the supervised hub lands in once it is up; `None` until then.
+pub type SharedHub = Arc<Mutex<Option<Box<dyn VisionHub>>>>;
 
-/// Feed the one vision status. When it changes, the windows and the CLI see
-/// it on display state. The lock is held across the emit so statuses arrive
-/// in the order they were decided.
 fn signal(app: &AppHandle, signal: Signal) {
-    let state = app.state::<SharedVision>();
-    let mut vision = state.lock().unwrap();
-    if vision.apply(signal) { crate::control::vision(app, vision.status()); }
+    app.state::<Lifecycle>().signal(signal);
 }
 
 /// The FieldLab application manifest (API 1.4): every durable event and
@@ -73,23 +68,10 @@ struct Publisher {
     app: AppHandle,
 }
 
-static PUBLICATIONS_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static PUBLISHER: Mutex<Option<Publisher>> = Mutex::new(None);
-static DETECTOR_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static SESSION_ID: Mutex<Option<String>> = Mutex::new(None);
 
-fn new_session_id() -> String {
-    let id = format!("sess-{}", uuid::Uuid::new_v4());
-    *SESSION_ID.lock().unwrap() = Some(id.clone());
-    id
-}
-
-fn session_id() -> Option<String> {
-    SESSION_ID.lock().unwrap().clone()
-}
-
-fn queue(mut message: Publish) {
-    if !PUBLICATIONS_ENABLED.load(std::sync::atomic::Ordering::SeqCst) { return; }
+/// Persist a publication locally, then publish asynchronously to the hub.
+pub(crate) fn queue(mut message: Publish) {
     // Hub timestamps describe acceptance, which may follow an offline period.
     // Preserve when the desktop observed the fact in the immutable queued body.
     let params = match &mut message {
@@ -117,41 +99,6 @@ fn queue(mut message: Publish) {
 fn publication_storage_error(app: &AppHandle, error: &str) {
     eprintln!("[EVENTS] durable publication failed: {error}");
     crate::control::error(app, format!("local event storage unavailable: {error}"));
-}
-
-/// Persist an app event locally, then publish asynchronously to the hub.
-fn queue_event(event_type: &str, payload: serde_json::Value) {
-    let mut params = serde_json::json!({"appId": APP_ID, "type": event_type, "id": format!("evt-{}", new_message_id()), "payload": payload});
-    if let Some(sid) = session_id() {
-        params["sessionId"] = serde_json::json!(sid);
-    }
-    queue(Publish::Event(params));
-}
-
-fn queue_command(command_type: &str, payload: serde_json::Value) -> String {
-    let id = format!("cmd-{}", new_message_id());
-    let mut params =
-        serde_json::json!({"appId": APP_ID, "type": command_type, "id": id, "payload": payload});
-    if let Some(sid) = session_id() {
-        params["sessionId"] = serde_json::json!(sid);
-    }
-    queue(Publish::Command(params));
-    id
-}
-
-fn queue_action_result(result_type: &str, command_id: &str, status: &str) {
-    let mut params = serde_json::json!({
-        "appId": APP_ID, "id": format!("result-{}", new_message_id()), "type": result_type, "commandId": command_id, "status": status,
-        "payload": {},
-    });
-    if let Some(sid) = session_id() {
-        params["sessionId"] = serde_json::json!(sid);
-    }
-    queue(Publish::ActionResult(params));
-}
-
-fn new_message_id() -> String {
-    uuid::Uuid::new_v4().to_string()
 }
 
 fn publication_time_ms() -> i64 {
@@ -245,28 +192,6 @@ pub(crate) fn wire_events(fact: &Fact) -> Vec<(&'static str, serde_json::Value)>
     }
 }
 
-/// Publish the durable events for the facts a session transition returned.
-/// Every transition call site passes its facts here, in order. This is the one
-/// place the "debug mode publishes nothing" rule is applied to the lifecycle.
-pub(crate) fn publish_facts(facts: &[Fact]) {
-    if !PUBLICATIONS_ENABLED.load(std::sync::atomic::Ordering::SeqCst) { return; }
-    for fact in facts {
-        // Each lock cycle is one session: minted at the lock, closed once the
-        // return to coding is recorded.
-        if matches!(fact, Fact::Locked(_)) { new_session_id(); }
-        for (event_type, payload) in wire_events(fact) {
-            if event_type == "desktop_locked" {
-                // The lock is a requested operation with a distinct outcome, not
-                // just an event: command → action result → the desktop_locked fact.
-                let command_id = queue_command("desktop.lock_requested", serde_json::json!({}));
-                queue_action_result("desktop.lock_succeeded", &command_id, "succeeded");
-            }
-            queue_event(event_type, payload);
-        }
-        if matches!(fact, Fact::CodingStarted) { *SESSION_ID.lock().unwrap() = None; }
-    }
-}
-
 /// Drive a hub through camera-set setup: register cameras, enable the
 /// metric, then apply per-camera overlays. Extracted from the async enable
 /// path so the ordering is unit-testable against the fake hub.
@@ -300,7 +225,6 @@ pub fn enable_on_hub(
 /// Start the supervisor in the background and pump its events into the
 /// session. No-op when REPS_HUB_DISABLED is set (dev without a hub).
 pub fn start(app: AppHandle) {
-    PUBLICATIONS_ENABLED.store(!app.state::<crate::Runtime>().is_debug(), std::sync::atomic::Ordering::SeqCst);
     if let Err(error) = if app.state::<crate::Runtime>().is_debug() { Ok(()) } else { start_publisher(app.clone()) } {
         publication_storage_error(&app, &error);
         return;
@@ -400,175 +324,34 @@ fn print_detect(data: &serde_json::Value) {
     }
 }
 
+/// Feed the hub's event stream to the lifecycle; the terminal lines and the
+/// display's last error are this adapter's own.
 fn pump_events(app: AppHandle, rx: std::sync::mpsc::Receiver<VisionEvent>) {
+    let life = app.state::<Lifecycle>();
     for event in rx {
         if app.state::<crate::Runtime>().is_stopping() { break; }
-        match event {
+        match &event {
             // Landmarks are terminal-only now: nothing in the webviews listens,
             // and pushing them at camera rate into both windows leaked memory.
-            VisionEvent::CameraFrame { camera_id, data } => {
-                if DETECTOR_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) && crate::control::camera_frame(&app) {
-                    let _ = app.emit_to("main", "vision-camera", serde_json::json!({"cameraId": camera_id, "data": data}));
-                }
-            }
-            VisionEvent::Landmarks(data) => print_detect(&data),
-            VisionEvent::Progress { value, unit, satisfied, context } => {
-                if !DETECTOR_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) || crate::control::preview_only(&app) { continue; }
-                if !context.belongs_to(WORKOUT_METRIC, session_id().as_deref()) {
-                    continue;
-                }
-                // A disconnected marker repeats the last value, so it credits nothing new.
-                let disconnected = context.camera_status.as_deref() == Some("disconnected")
-                    || context.consensus.as_ref().is_some_and(|c| c["state"] == "disconnected");
-                signal(&app, if disconnected { Signal::CameraDisconnected } else { Signal::LiveFrame });
-                let core_state = app.state::<crate::SharedCore>();
-                let mut core = core_state.lock().unwrap();
-                publish_facts(&core.session.report_progress(Progress { value, unit, satisfied }));
-                let snap = crate::persist_and_snapshot(&mut core);
-                drop(core);
-                crate::emit_snapshot(&app, &snap);
-                if satisfied {
-                    disable_metric_async(&app);
-                }
-            }
+            VisionEvent::Landmarks(data) => print_detect(data),
             VisionEvent::Semantic { kind, payload } => {
                 if kind == "detector_error" || kind == "stream_ended" {
-                    crate::control::error(&app,format!("{kind}: {payload}"));
-                    if DETECTOR_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) { signal(&app, Signal::DetectorFailed(kind.clone())); }
+                    crate::control::error(&app, format!("{kind}: {payload}"));
                 }
                 if kind == "rep_completed" || kind == "target_reached" {
                     println!("[DETECT] ✓ {}", kind);
                 }
             }
-            VisionEvent::Health(health) => {
-                if health.vision_host == "down" { signal(&app, Signal::HubDown); }
-            }
-            VisionEvent::ConnectionLost => signal(&app, Signal::ConnectionLost),
+            _ => {}
         }
+        life.progress(event);
     }
-}
-
-/// Enable the workout metric for the current prescription (fire-and-forget;
-/// failures signal the vision status so the UI offers honor mode).
-pub fn enable_metric_async(app: &AppHandle, exercise: String, target_reps: u32, target_seconds: f64) {
-    let generation = app.state::<crate::Runtime>().detector_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-    let app = app.clone();
-    std::thread::spawn(move || {
-        if app.state::<crate::Runtime>().is_stopping() { return; }
-        let built = detector::load_inputs(&app.state::<crate::Runtime>().normal_home)
-            .and_then(|inputs| detector::detector_request(&inputs, &exercise, target_reps, target_seconds));
-        let (mut request, camera_set) = match built {
-            Ok(built) => built,
-            Err(HonorReason::BadSpecs(err)) => {
-                eprintln!("hub: bad exercise specs: {err}");
-                return;
-            }
-            Err(HonorReason::NoSpec(exercise)) => {
-                eprintln!("hub: no spec for exercise {exercise}; honor mode");
-                queue_event(
-                    "system_error",
-                    serde_json::json!({"stage": "enable_metric", "error": format!("no spec for {exercise}")}),
-                );
-                signal(&app, Signal::EnableFailed(format!("no spec for {exercise}")));
-                return;
-            }
-            Err(HonorReason::PhoneUrlInvalid) => {
-                signal(&app, Signal::EnableFailed("Cannot read phone stream credentials file".into()));
-                return;
-            }
-            Err(HonorReason::Settings(error)) => {
-                signal(&app, Signal::EnableFailed(error));
-                return;
-            }
-        };
-        let state = app.state::<SharedHub>();
-        let mut guard = state.lock().unwrap();
-        if app.state::<crate::Runtime>().is_stopping() ||
-            app.state::<crate::Runtime>().detector_generation.load(std::sync::atomic::Ordering::SeqCst) != generation { return; }
-        let sid = if app.state::<crate::Runtime>().is_debug() { new_session_id() } else { session_id().unwrap_or_else(new_session_id) };
-        request.config["sessionId"] = serde_json::json!(sid);
-        match guard.as_mut() {
-            Some(hub) => {
-                DETECTOR_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
-                match enable_on_hub(hub.as_mut(), &camera_set, &request) {
-                    Ok(()) => {
-                        drop(guard);
-                        // The hub answered, even if it was restarted since it last said so.
-                        signal(&app, Signal::HubUp);
-                        queue_event("detector_started", serde_json::json!({"exercise": exercise}));
-                    }
-                    Err(err) => {
-                        DETECTOR_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
-                        drop(guard);
-                        eprintln!("hub: enable_metric failed: {err}");
-                        queue_event(
-                            "system_error",
-                            serde_json::json!({"stage": "enable_metric", "error": err.to_string()}),
-                        );
-                        signal(&app, Signal::EnableFailed(err.to_string()));
-                    }
-                }
-            }
-            None => {
-                drop(guard);
-                queue_event(
-                    "system_error",
-                    serde_json::json!({"stage": "enable_metric", "error": "hub not running"}),
-                );
-                signal(&app, Signal::EnableFailed("hub not running".into()));
-            }
-        }
-    });
-}
-
-/// Disable the workout metric (camera released). Fire-and-forget.
-pub fn disable_metric_async(app: &AppHandle) {
-    let generation = app.state::<crate::Runtime>().detector_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-    DETECTOR_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
-    signal(app, Signal::DetectorOff);
-    let app = app.clone();
-    std::thread::spawn(move || {
-        let state = app.state::<SharedHub>();
-        let mut guard = state.lock().unwrap();
-        if app.state::<crate::Runtime>().detector_generation.load(std::sync::atomic::Ordering::SeqCst) != generation { return; }
-        if let Some(hub) = guard.as_mut() {
-            if let Err(err) = hub.disable_metric(WORKOUT_METRIC) {
-                eprintln!("hub: disable_metric failed: {err}");
-            } else {
-                drop(guard);
-                queue_event("detector_stopped", serde_json::json!({}));
-            }
-        }
-    });
-}
-
-pub(crate) fn disable_metric_now(app: &AppHandle) {
-    app.state::<crate::Runtime>().detector_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    DETECTOR_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
-    signal(app, Signal::DetectorOff);
-    let state = app.state::<SharedHub>();
-    if let Some(hub) = state.lock().unwrap().as_mut() { let _ = hub.disable_metric(WORKOUT_METRIC); };
-}
-
-/// Honor-mode completion: the camera path failed, the user pressed Done.
-pub fn honor_complete(app: &AppHandle) -> Result<engine::types::Snapshot, String> {
-    let core_state = app.state::<crate::SharedCore>();
-    let mut core = core_state.lock().unwrap();
-    let facts = core.session.honor_complete();
-    if facts.is_empty() {
-        return Err("No active workout to complete".into());
-    }
-    publish_facts(&facts);
-    let snap = crate::persist_and_snapshot(&mut core);
-    drop(core);
-    crate::emit_snapshot(app, &snap);
-    disable_metric_async(app);
-    Ok(snap)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::detector;
 
     #[test]
     fn enable_on_hub_registers_cameras_then_enables_then_applies_overlays() {
@@ -600,7 +383,7 @@ mod tests {
         enable_on_hub(&mut hub, &camera_set, &request).unwrap();
         // stale-stream teardown first, then registration, enable, overlays
         assert_eq!(
-            hub.calls,
+            *hub.calls.lock().unwrap(),
             vec![
                 format!("disable:{WORKOUT_METRIC}"),
                 "add_camera:front".to_string(),
@@ -680,10 +463,7 @@ mod tests {
 
 /// Wait for startup/enable operations, release capture, then drop our supervisor.
 pub(crate) fn stop(app: &AppHandle) {
-    PUBLICATIONS_ENABLED.store(false, std::sync::atomic::Ordering::SeqCst);
-    DETECTOR_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
-    app.state::<crate::Runtime>().detector_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    *SESSION_ID.lock().unwrap() = None;
+    app.state::<Lifecycle>().shutdown();
     let state = app.state::<SharedHub>();
     if let Some(mut hub) = state.lock().unwrap().take() {
         let _ = hub.disable_metric(WORKOUT_METRIC);

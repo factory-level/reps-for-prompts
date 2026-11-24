@@ -1,8 +1,8 @@
 use std::sync::{Mutex, atomic::Ordering};
-use engine::{activity::{AgentPresence, detect}, clock::{Clock, SystemClock}, session::Release, types::Phase};
+use engine::{activity::{AgentPresence, detect}, clock::{Clock, SystemClock}, types::Phase};
 use serde::Serialize;
 use tauri::{AppHandle, Manager};
-use crate::{SharedCore, Runtime};
+use crate::{Lifecycle, Runtime};
 
 #[derive(Default)]
 pub struct Daily { pub agents: AgentPresence, pub snooze_until: f64, pub checked_at: f64 }
@@ -12,7 +12,7 @@ pub type SharedDaily = Mutex<Daily>;
 pub struct Status { workday_end:String, warn_minutes:u32, last_day_warning:String, checked_at: f64, agents: AgentPresence, snooze_until: f64, work_minutes: f64, lock_mode: bool, pub sync: String }
 
 pub fn daily_status(app: AppHandle) -> Status {
-    let core = app.state::<SharedCore>(); let core = core.lock().unwrap();
+    let life = app.state::<Lifecycle>(); let core = life.core();
     let daily = app.state::<SharedDaily>(); let daily = daily.lock().unwrap();
     Status { workday_end:core.store.setting("workday_end","18:00"), warn_minutes:core.store.setting("workday_warn_minutes","60").parse().unwrap_or(60), last_day_warning:core.store.setting("last_day_warning",""), checked_at: daily.checked_at, agents: daily.agents.clone(), snooze_until: daily.snooze_until,
         work_minutes: core.store.setting("work_minutes", "25").parse().unwrap_or(25.),
@@ -21,42 +21,23 @@ pub fn daily_status(app: AppHandle) -> Status {
 }
 
 pub fn reminder_action(app: AppHandle, action: String, minutes: Option<u32>) -> Result<(), String> {
-    if app.state::<Runtime>().is_debug() { return Err("Switch to Workout mode first".into()); }
-    let now = SystemClock.now();
-    let state = app.state::<SharedCore>(); let mut core = state.lock().unwrap();
-    let phase = core.session.snapshot(now).phase;
-    if action == "start" {
-        let facts = core.session.start_workout(&SystemClock.today());
-        if facts.is_empty() {
-            return Err(if phase == Phase::Coding { "Today's routine is complete; nothing to start" } else { "A workout is already in progress" }.into());
-        }
-        // Before the detector is enabled: the enable path reads the session id.
-        crate::hub::publish_facts(&facts);
-        core.store.set_setting("snooze_until", "0").map_err(|e| e.to_string())?;
-        app.state::<SharedDaily>().lock().unwrap().snooze_until = 0.;
-        let snap = crate::persist_and_snapshot(&mut core); drop(core);
-        crate::enable_metric_for(&app, &snap); crate::emit_snapshot(&app, &snap);
-    } else if action == "snooze" || action == "skip" {
-        if !matches!(phase, Phase::Coding | Phase::ExerciseRequired) { return Err("Finish or stop the current workout first".into()); }
-        let until = if action == "snooze" {
-            let m = minutes.unwrap_or(15); if ![5,15,30].contains(&m) { return Err("Choose 5, 15, or 30 minutes".into()); }
-            now + m as f64 * 60.
-        } else { 0. };
-        core.store.set_setting("snooze_until", &until.to_string()).map_err(|e| e.to_string())?;
-        app.state::<SharedDaily>().lock().unwrap().snooze_until = until;
-        crate::hub::publish_facts(&core.session.release(if action == "snooze" { Release::Snooze } else { Release::Skip }, now));
-        // Snooze means remind at expiry, rather than expiry plus a full interval.
-        if until > 0. { core.session.configure_timer(0., now); }
-        else { let interval = core.store.setting("work_minutes", "25").parse().unwrap_or(25.); core.session.configure_timer(interval, now); }
-        let snap = crate::persist_and_snapshot(&mut core); drop(core);
-        crate::hub::disable_metric_async(&app); crate::windows::release(&app); crate::emit_snapshot(&app, &snap);
-    } else { return Err("Unknown reminder action".into()); }
+    let life = app.state::<Lifecycle>();
+    match action.as_str() {
+        "start" => life.start()?,
+        "snooze" => life.snooze(minutes.unwrap_or(15))?,
+        "skip" => life.skip()?,
+        _ => return Err("Unknown reminder action".into()),
+    };
+    // The tick loop reads the snooze from Daily; the lifecycle stored it.
+    let snooze_until = life.core().store.setting("snooze_until", "0").parse().unwrap_or(0.);
+    app.state::<SharedDaily>().lock().unwrap().snooze_until = snooze_until;
+    if action != "start" { crate::windows::release(&app); }
     Ok(())
 }
 
 pub fn save_daily_settings(app: AppHandle, minutes: u32, lock_mode: bool) -> Result<(), String> {
     if !(1..=240).contains(&minutes) { return Err("Interval must be 1–240 minutes".into()); }
-    let state = app.state::<SharedCore>(); let mut core = state.lock().unwrap();
+    let life = app.state::<Lifecycle>(); let mut core = life.core();
     if core.session.snapshot(SystemClock.now()).phase != Phase::Coding { return Err("Change settings between workouts".into()); }
     core.store.set_setting("work_minutes", &minutes.to_string()).map_err(|e| e.to_string())?;
     core.store.set_setting("lock_mode", if lock_mode { "1" } else { "0" }).map_err(|e| e.to_string())?;
@@ -88,7 +69,7 @@ pub fn routine_settings(app:AppHandle) -> Result<String,String> {
     match std::fs::read_to_string(path){Ok(s)=>Ok(s),Err(e) if e.kind()==std::io::ErrorKind::NotFound=>Ok(crate::ROUTINE_JSON.into()),Err(e)=>Err(e.to_string())}
 }
 pub fn save_routine(app:AppHandle,json:String)->Result<(),String>{
-    let state=app.state::<SharedCore>();let mut core=state.lock().unwrap();
+    let life=app.state::<Lifecycle>();let mut core=life.core();
     if core.session.snapshot(SystemClock.now()).phase!=Phase::Coding{return Err("Change routine between workouts".into());}
     let mut plan=engine::plan::DailyPlan::from_routine_json(&json,&SystemClock.today())?;
     if let Some(current)=core.session.plan(){

@@ -1,6 +1,6 @@
 //! Startup policy, separate from workout phases. Debug never shares workout data.
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -13,7 +13,6 @@ pub struct Runtime {
     pub session_home: PathBuf,
     pub stopping: AtomicBool,
     pub lock_mode: AtomicBool,
-    pub detector_generation: AtomicU64,
 }
 
 impl Runtime {
@@ -32,7 +31,7 @@ impl Runtime {
             }
             path
         } else { normal_home.clone() };
-        Ok(Self {mode, normal_home, session_home, stopping: AtomicBool::new(false), lock_mode: AtomicBool::new(false), detector_generation: AtomicU64::new(0)})
+        Ok(Self {mode, normal_home, session_home, stopping: AtomicBool::new(false), lock_mode: AtomicBool::new(false)})
     }
 
     pub fn is_debug(&self) -> bool { self.mode == AppMode::Debug }
@@ -118,7 +117,7 @@ mod isolation_tests {
         let _ = debug.session.start_workout(&SystemClock.today());
         let _ = debug.session.report_progress(Progress { value: 999.0, unit: "reps".into(), satisfied: true });
         let _ = debug.session.confirm_weight(25.0, &SystemClock.today());
-        crate::persist_and_snapshot(&mut debug);
+        crate::lifecycle::persist_and_snapshot(&mut debug, SystemClock.now());
         assert_eq!(debug.store.history(100).unwrap().len(), 1);
         assert_eq!(normal.store.history(100).unwrap().len(), before);
         assert_eq!(normal.store.setting("plan_state", ""), "real-plan-sentinel");

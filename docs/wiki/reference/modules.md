@@ -3,7 +3,7 @@
 | Directory | Purpose |
 |---|---|
 | `app/src` | React desktop views and interaction |
-| `app/src-tauri/src` | Native commands, windows, resources and hub integration |
+| `app/src-tauri/src` | Native commands, the workout lifecycle (`lifecycle.rs`), windows, resources and hub integration |
 | `app/src-tauri/engine` | Session, timer, daily plan and local history |
 | `app/src-tauri/hub-client` | Hub client, process supervisor and publication queue |
 | `app/src-tauri/reps-cli` | The `rfp` CLI: control socket commands, history, sync, site profile |
