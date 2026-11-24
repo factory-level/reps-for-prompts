@@ -59,8 +59,8 @@ NRestarts` is unchanged.
       `simulate_progress`
 - [ ] Kill the hub mid-set (`pkill -f hubd.mjs`): one restart happens, the set
       continues
-- [ ] Kill it again: **Done (honor)** completes the set; the `exercise_history`
-      row has `verified = 0`
+- [ ] Kill it again: `rfp finish --honor` completes the set (there is no UI
+      button); the `exercise_history` row has `verified = 0`
 - [ ] Camera LED: on only between starting the workout and unlock — never
       during coding
 - [ ] Phone tuning app (`https://<lan-ip>:8443/`, pairing token required):

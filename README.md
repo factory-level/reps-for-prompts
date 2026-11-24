@@ -79,10 +79,10 @@ rfp service status|logs         # the background service
 Every command takes `--json`. `rfp --help` lists the full surface. Set
 `REPS_APP_HOME` to point at an isolated data directory.
 
-The app opens in **Debug** mode on first launch, which uses throwaway workout
-data so test sets never touch your real history. The **Debug / Workout** switch
-stays visible in release builds. Emergency escape is
-**Ctrl+Shift+Backspace held for three seconds**.
+The app starts in **Debug** mode, which uses throwaway workout data so test
+sets never touch your real history. Switch with `rfp mode debug|workout`; test
+by hand with `rfp debug …` (see `docs/wiki/debug-mode.md`). The emergency
+escape is `rfp cancel`, which stops a workout without credit.
 
 ## How it works
 

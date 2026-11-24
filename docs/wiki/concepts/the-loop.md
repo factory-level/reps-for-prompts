@@ -8,8 +8,9 @@
 
 Once the day's plan is complete, the timer no longer requests more sets that day.
 If detection is unavailable, honor-mode completion is unverified; it is not
-camera evidence. Debug mode offers manual test controls in an ordinary window.
+camera evidence. Debug mode offers manual test controls through
+[`rfp debug`](../debug-mode.md).
 
-Emergency release: hold **Ctrl+Shift+Backspace for three seconds**.
-Check this on the target desktop before relying on lock mode.
+Emergency release: `rfp cancel` stops the current workout without completion
+credit.
 See [routine configuration](../reference/config.md).

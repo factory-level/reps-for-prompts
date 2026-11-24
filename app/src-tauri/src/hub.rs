@@ -32,7 +32,6 @@ fn phone_stream_url(value: &str) -> bool {
 impl Default for CameraSettings {
     fn default() -> Self { Self { consensus: false, usb_device: "/dev/video0".into(), usb_rotation: default_usb_rotation(), phone_url: String::new(), phone_rotation: 0 } }
 }
-#[tauri::command]
 pub fn get_camera_settings(app: AppHandle) -> Result<CameraSettings, String> {
     let path = app.state::<crate::Runtime>().normal_home.join("cameras.json");
     match std::fs::read(path) {
@@ -41,7 +40,6 @@ pub fn get_camera_settings(app: AppHandle) -> Result<CameraSettings, String> {
         Err(e) => Err(e.to_string()),
     }
 }
-#[tauri::command]
 pub fn save_camera_settings(app: AppHandle, settings: CameraSettings) -> Result<(), String> {
     if !matches!(settings.usb_rotation, 0 | 90 | 180 | 270) || !matches!(settings.phone_rotation, 0 | 90 | 180 | 270) || !settings.usb_device.starts_with("/dev/video") {
         return Err("Choose a /dev/video device and a valid rotation".into());
@@ -599,9 +597,6 @@ fn pump_events(app: AppHandle, rx: std::sync::mpsc::Receiver<VisionEvent>) {
                 if !DETECTOR_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) || crate::control::preview_only(&app) { continue; }
                 if !context.belongs_to(WORKOUT_METRIC, session_id().as_deref()) {
                     continue;
-                }
-                if let Some(status) = &context.consensus {
-                    let _ = app.emit("vision-consensus", status);
                 }
                 let core_state = app.state::<crate::SharedCore>();
                 let mut core = core_state.lock().unwrap();
