@@ -1,10 +1,10 @@
 {
-  "hubCommit": "9609cbd4f84a848247ebe3934808e80d69ba8ec4",
+  "hubCommit": "0b8afdd7c30e9e4fc4d71d21fa79e018cc2327a3",
   "hubDirty": false,
   "apiVersion": "1.6",
   "nodeEngine": ">=22.5",
   "artifactSha256s": {
-    "hubd.mjs": "d4e0a65e019a10e3391d3087676fe6e2371ed1682c0a20fdbe53adba046fc199",
+    "hubd.mjs": "3b58d0baf9363d72ea459a62e7e0f89fff0dcf7ef4c47d5598fb97b5792f50a3",
     "public/app.js": "8e4eb0da8f21fd8c400a85a1b21bcec40fead282739fac1ab1435ec28f4fcf7a",
     "public/debug-cameras.css": "881f43c8d875b619c1b1a39889563c9cb0ac7a4132e35ed59c8153d5df2e1d9e",
     "public/debug-cameras.html": "e03480c97fdb7ae98b6463921f863a276e5975c929e111b69a7dce13014ab193",
