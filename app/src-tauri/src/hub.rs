@@ -12,6 +12,7 @@ use hub_client::{EnableMetric, HubSupervisor, HubSupervisorConfig, VisionEvent, 
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::detector::{self, CameraSet, CameraSettings, HonorReason};
+use crate::vision_status::{Signal, Vision};
 
 pub const WORKOUT_METRIC: &str = "workout";
 pub const APP_ID: &str = "reps";
@@ -26,6 +27,16 @@ pub fn save_camera_settings(app: AppHandle, settings: CameraSettings) -> Result<
 }
 
 pub type SharedHub = Mutex<Option<Box<dyn VisionHub>>>;
+pub type SharedVision = Mutex<Vision>;
+
+/// Feed the one vision status. When it changes, the windows and the CLI see
+/// it on display state. The lock is held across the emit so statuses arrive
+/// in the order they were decided.
+fn signal(app: &AppHandle, signal: Signal) {
+    let state = app.state::<SharedVision>();
+    let mut vision = state.lock().unwrap();
+    if vision.apply(signal) { crate::control::vision(app, vision.status()); }
+}
 
 /// The FieldLab application manifest (API 1.4): every durable event and
 /// command reps publishes, declared up front. The hub rejects unregistered
@@ -286,22 +297,6 @@ pub fn enable_on_hub(
     Ok(())
 }
 
-/// Why the hub slot is empty: still starting, or failed and retrying. Keeps
-/// `rfp camera status` from claiming the hub "is starting" forever after a
-/// start that actually failed.
-static LAST_HUB_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-
-fn set_hub_error(error: Option<String>) {
-    if let Ok(mut slot) = LAST_HUB_ERROR.lock() { *slot = error; }
-}
-
-pub fn unavailable_reason() -> String {
-    match LAST_HUB_ERROR.lock().ok().and_then(|slot| slot.clone()) {
-        Some(error) => format!("Vision hub is not running ({error}); retrying in the background"),
-        None => "Vision hub is starting".into(),
-    }
-}
-
 /// Start the supervisor in the background and pump its events into the
 /// session. No-op when REPS_HUB_DISABLED is set (dev without a hub).
 pub fn start(app: AppHandle) {
@@ -328,7 +323,7 @@ pub fn start(app: AppHandle) {
                 match app.path().resource_dir() {
                     Ok(resources) => HubSupervisorConfig::bundled(&resources, &resources.join("reps-vision"), &crate::dirs_next_data_dir()),
                     Err(err) => {
-                        let _ = app.emit("vision-fallback", serde_json::json!({"reason": err.to_string()}));
+                        signal(&app, Signal::HubStartFailed(format!("Vision hub is not running ({err})")));
                         return;
                     }
                 }
@@ -347,17 +342,16 @@ pub fn start(app: AppHandle) {
             let supervisor = HubSupervisor::start_retrying(
                 config,
                 { let app = app.clone(); move || app.state::<crate::Runtime>().is_stopping() },
-                move |error, delay| {
-                    set_hub_error(Some(error.to_string()));
+                { let app = app.clone(); move |error, delay| {
+                    signal(&app, Signal::HubStartFailed(format!("Vision hub is not running ({error}); retrying in the background")));
                     eprintln!("hub: failed to start ({error}); honor mode, retrying in {}s", delay.as_secs_f32());
-                },
+                } },
             );
             let state = app.state::<SharedHub>();
             let mut slot = state.lock().unwrap();
             if app.state::<crate::Runtime>().is_stopping() { return; }
             match supervisor {
                 Some(mut supervisor) => {
-                    set_hub_error(None);
                     if app.state::<crate::Runtime>().is_stopping() { return; }
                     // A desktop restart begins idle rather than restoring an old camera stream.
                     let _ = supervisor.disable_metric(WORKOUT_METRIC);
@@ -373,7 +367,7 @@ pub fn start(app: AppHandle) {
                     }
                     *slot = Some(Box::new(supervisor));
                     drop(slot);
-                    let _ = app.emit("vision-event", serde_json::json!({"kind": "hub_up"}));
+                    signal(&app, Signal::HubUp);
                     if let Some(rx) = receiver {
                         pump_events(app, rx);
                     }
@@ -423,6 +417,10 @@ fn pump_events(app: AppHandle, rx: std::sync::mpsc::Receiver<VisionEvent>) {
                 if !context.belongs_to(WORKOUT_METRIC, session_id().as_deref()) {
                     continue;
                 }
+                // A disconnected marker repeats the last value, so it credits nothing new.
+                let disconnected = context.camera_status.as_deref() == Some("disconnected")
+                    || context.consensus.as_ref().is_some_and(|c| c["state"] == "disconnected");
+                signal(&app, if disconnected { Signal::CameraDisconnected } else { Signal::LiveFrame });
                 let core_state = app.state::<crate::SharedCore>();
                 let mut core = core_state.lock().unwrap();
                 publish_facts(&core.session.report_progress(Progress { value, unit, satisfied }));
@@ -436,44 +434,22 @@ fn pump_events(app: AppHandle, rx: std::sync::mpsc::Receiver<VisionEvent>) {
             VisionEvent::Semantic { kind, payload } => {
                 if kind == "detector_error" || kind == "stream_ended" {
                     crate::control::error(&app,format!("{kind}: {payload}"));
-                    let _ = app.emit("vision-fallback", serde_json::json!({"reason": kind, "details": payload}));
+                    if DETECTOR_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) { signal(&app, Signal::DetectorFailed(kind.clone())); }
                 }
                 if kind == "rep_completed" || kind == "target_reached" {
                     println!("[DETECT] ✓ {}", kind);
                 }
-                let _ = app.emit(
-                    "vision-event",
-                    serde_json::json!({"kind": kind, "payload": payload}),
-                );
             }
             VisionEvent::Health(health) => {
-                let failed = health.vision_host == "down";
-                let _ = app.emit(
-                    "vision-event",
-                    serde_json::json!({"kind": "health", "payload": {
-                        "visionHost": health.vision_host,
-                        "camera": health.camera,
-                    }}),
-                );
-                if failed {
-                    let _ = app.emit(
-                        "vision-fallback",
-                        serde_json::json!({"reason": "hub down after restart"}),
-                    );
-                }
+                if health.vision_host == "down" { signal(&app, Signal::HubDown); }
             }
-            VisionEvent::ConnectionLost => {
-                let _ = app.emit(
-                    "vision-event",
-                    serde_json::json!({"kind": "connection_lost"}),
-                );
-            }
+            VisionEvent::ConnectionLost => signal(&app, Signal::ConnectionLost),
         }
     }
 }
 
 /// Enable the workout metric for the current prescription (fire-and-forget;
-/// failures surface as vision-fallback so the UI offers honor mode).
+/// failures signal the vision status so the UI offers honor mode).
 pub fn enable_metric_async(app: &AppHandle, exercise: String, target_reps: u32, target_seconds: f64) {
     let generation = app.state::<crate::Runtime>().detector_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
     let app = app.clone();
@@ -493,18 +469,15 @@ pub fn enable_metric_async(app: &AppHandle, exercise: String, target_reps: u32, 
                     "system_error",
                     serde_json::json!({"stage": "enable_metric", "error": format!("no spec for {exercise}")}),
                 );
-                let _ = app.emit(
-                    "vision-fallback",
-                    serde_json::json!({"reason": format!("no spec for {exercise}")}),
-                );
+                signal(&app, Signal::EnableFailed(format!("no spec for {exercise}")));
                 return;
             }
             Err(HonorReason::PhoneUrlInvalid) => {
-                let _ = app.emit("vision-fallback", serde_json::json!({"reason": "Cannot read phone stream credentials file"}));
+                signal(&app, Signal::EnableFailed("Cannot read phone stream credentials file".into()));
                 return;
             }
             Err(HonorReason::Settings(error)) => {
-                let _ = app.emit("vision-fallback", serde_json::json!({"reason": error}));
+                signal(&app, Signal::EnableFailed(error));
                 return;
             }
         };
@@ -520,6 +493,8 @@ pub fn enable_metric_async(app: &AppHandle, exercise: String, target_reps: u32, 
                 match enable_on_hub(hub.as_mut(), &camera_set, &request) {
                     Ok(()) => {
                         drop(guard);
+                        // The hub answered, even if it was restarted since it last said so.
+                        signal(&app, Signal::HubUp);
                         queue_event("detector_started", serde_json::json!({"exercise": exercise}));
                     }
                     Err(err) => {
@@ -530,22 +505,17 @@ pub fn enable_metric_async(app: &AppHandle, exercise: String, target_reps: u32, 
                             "system_error",
                             serde_json::json!({"stage": "enable_metric", "error": err.to_string()}),
                         );
-                        let _ = app.emit(
-                            "vision-fallback",
-                            serde_json::json!({"reason": err.to_string()}),
-                        );
+                        signal(&app, Signal::EnableFailed(err.to_string()));
                     }
                 }
             }
             None => {
+                drop(guard);
                 queue_event(
                     "system_error",
                     serde_json::json!({"stage": "enable_metric", "error": "hub not running"}),
                 );
-                let _ = app.emit(
-                    "vision-fallback",
-                    serde_json::json!({"reason": "hub not running"}),
-                );
+                signal(&app, Signal::EnableFailed("hub not running".into()));
             }
         }
     });
@@ -555,6 +525,7 @@ pub fn enable_metric_async(app: &AppHandle, exercise: String, target_reps: u32, 
 pub fn disable_metric_async(app: &AppHandle) {
     let generation = app.state::<crate::Runtime>().detector_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
     DETECTOR_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+    signal(app, Signal::DetectorOff);
     let app = app.clone();
     std::thread::spawn(move || {
         let state = app.state::<SharedHub>();
@@ -574,6 +545,7 @@ pub fn disable_metric_async(app: &AppHandle) {
 pub(crate) fn disable_metric_now(app: &AppHandle) {
     app.state::<crate::Runtime>().detector_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     DETECTOR_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+    signal(app, Signal::DetectorOff);
     let state = app.state::<SharedHub>();
     if let Some(hub) = state.lock().unwrap().as_mut() { let _ = hub.disable_metric(WORKOUT_METRIC); };
 }

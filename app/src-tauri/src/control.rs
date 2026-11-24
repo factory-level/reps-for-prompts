@@ -6,13 +6,15 @@ use crate::{SharedCore,Runtime,daily};
 
 #[derive(Clone,serde::Serialize)]
 #[serde(rename_all="camelCase")]
-pub struct DisplayState {pub notice:Option<String>,pub view:String,pub preview_only:bool,pub last_error:Option<String>,pub frames_seen:u64}
-impl Default for DisplayState{fn default()->Self{Self{notice:None,view:"screen".into(),preview_only:false,last_error:None,frames_seen:0}}}
+pub struct DisplayState {pub notice:Option<String>,pub view:String,pub preview_only:bool,pub last_error:Option<String>,pub frames_seen:u64,pub vision:crate::vision_status::VisionStatus}
+impl Default for DisplayState{fn default()->Self{Self{notice:None,view:"screen".into(),preview_only:false,last_error:None,frames_seen:0,vision:Default::default()}}}
 pub type SharedDisplay=std::sync::Mutex<DisplayState>;
 #[tauri::command]
 pub fn get_display_state(app:AppHandle)->DisplayState {app.state::<SharedDisplay>().lock().unwrap().clone()}
 pub fn preview_only(app:&AppHandle)->bool{app.state::<SharedDisplay>().lock().unwrap().preview_only}
 pub fn error(app:&AppHandle,message:String){app.state::<SharedDisplay>().lock().unwrap().last_error=Some(message);}
+/// The camera/vision path changed state: tell the windows.
+pub fn vision(app:&AppHandle,status:crate::vision_status::VisionStatus){let state={let state=app.state::<SharedDisplay>();let mut s=state.lock().unwrap();s.vision=status;s.clone()};let _=app.emit("display-state",state);}
 pub fn camera_frame(app:&AppHandle)->bool{let state=app.state::<SharedDisplay>();let mut s=state.lock().unwrap();if s.view!="camera"{return false;}s.frames_seen=s.frames_seen.saturating_add(1);true}
 pub fn video_event(app:&AppHandle,event:&serde_json::Value){let state=app.state::<SharedDisplay>();let mut s=state.lock().unwrap();if s.view!="video"{return;}if event["event"]=="frame"{s.frames_seen=s.frames_seen.saturating_add(1);}if event["event"]=="error"{s.last_error=event["message"].as_str().map(str::to_string);}}
 fn view(app:&AppHandle,name:&str,preview:bool){
@@ -66,7 +68,8 @@ fn dispatch(app:&AppHandle, command:Command)->Result<serde_json::Value,String>{
     "stop"=>stop_preview(app),
     "status"=>{
      let state=app.state::<crate::hub::SharedHub>();let mut hub=state.lock().unwrap();
-     let health=hub.as_mut().ok_or_else(crate::hub::unavailable_reason)?.health().map_err(|e|e.to_string())?;
+     // No hub to ask: say why vision is unavailable rather than "starting" forever.
+     let health=hub.as_mut().ok_or_else(||match app.state::<crate::hub::SharedVision>().lock().unwrap().status(){crate::vision_status::VisionStatus::Unavailable{reason}=>reason,_=>"Vision hub is starting".into()})?.health().map_err(|e|e.to_string())?;
      return Ok(serde_json::json!({"visionHost":health.vision_host,"camera":health.camera,"enabledMetrics":health.enabled_metrics,"display":get_display_state(app.clone())}));
     },_=>unreachable!()
    }

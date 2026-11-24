@@ -38,6 +38,7 @@ use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
 
 mod detector;
 mod hub;
+mod vision_status;
 mod windows;
 mod runtime;
 mod daily;
@@ -592,6 +593,7 @@ pub fn run() {
             child: None,
         }) as SharedDebugProcess)
         .manage(Mutex::new(None) as hub::SharedHub)
+        .manage(hub::SharedVision::default())
         .invoke_handler(tauri::generate_handler![
             control::get_display_state,
             control::workout_action,

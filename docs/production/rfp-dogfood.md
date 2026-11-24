@@ -23,7 +23,7 @@ restarts at the configured interval after a completed or skipped break.
 
 Settings expose interval, optional lock mode, and an editor for existing routine
 movements. Debug is still isolated and never uploads simulated workouts.
-The emergency escape remains Ctrl+Shift+Backspace held three seconds.
+The emergency escape is `rfp cancel`.
 
 ```sh
 reps status --json

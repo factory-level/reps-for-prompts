@@ -5,7 +5,6 @@ import { Screen } from "./Screen";
 import type { Snapshot } from "./snapshot";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(() => Promise.resolve()) }));
-vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(() => Promise.resolve(() => {})) }));
 
 const base: Snapshot = {
   phase: "CODING",
@@ -49,6 +48,28 @@ describe("Screen", () => {
     expect(screen.getByText("Jump rope")).toBeInTheDocument();
     expect(screen.getByText("042")).toBeInTheDocument();
     expect(screen.getByText("/ 60 sec")).toBeInTheDocument();
+  });
+});
+
+describe("Camera down", () => {
+  const down = { state: "unavailable", reason: "hub not running" } as const;
+  const text = /Camera down · finish via rfp finish --honor/;
+  it("shows while vision is unavailable during an active workout, and clears on recovery", () => {
+    const active: Snapshot = { ...base, phase: "WORKOUT_ACTIVE" };
+    const { rerender } = render(<Screen snapshot={active} variant="primary" vision={down} />);
+    expect(screen.getByText(text)).toBeInTheDocument();
+    rerender(<Screen snapshot={active} variant="primary" vision={{ state: "available" }} />);
+    expect(screen.queryByText(text)).not.toBeInTheDocument();
+  });
+  it("stays quiet outside an active workout, while starting, and without a status", () => {
+    const { rerender } = render(<Screen snapshot={base} variant="primary" vision={down} />);
+    expect(screen.queryByText(text)).not.toBeInTheDocument();
+    rerender(<Screen snapshot={{ ...base, phase: "EXERCISE_REQUIRED" }} variant="primary" vision={down} />);
+    expect(screen.queryByText(text)).not.toBeInTheDocument();
+    rerender(<Screen snapshot={{ ...base, phase: "WORKOUT_ACTIVE" }} variant="primary" vision={{ state: "starting" }} />);
+    expect(screen.queryByText(text)).not.toBeInTheDocument();
+    rerender(<Screen snapshot={{ ...base, phase: "WORKOUT_ACTIVE" }} variant="primary" />);
+    expect(screen.queryByText(text)).not.toBeInTheDocument();
   });
 });
 
