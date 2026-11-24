@@ -206,19 +206,6 @@ fn shutdown_runtime(app: &AppHandle) {
     app.state::<Runtime>().cleanup();
 }
 
-/// Emergency escape remains available in enforced Workout mode.
-fn emergency_escape(_app: AppHandle, state: State<Lifecycle>) -> Snapshot {
-    let mut core = state.core();
-    state.publish_facts(&core.session.release(Release::Cancel, SystemClock.now()));
-    let minutes = core.store.setting("work_minutes", "25").parse().unwrap_or(25.);
-    core.session.configure_timer(minutes, SystemClock.now());
-    let snap = state.persist(&mut core);
-    drop(core);
-    state.disable();
-    state.emit(&snap);
-    snap
-}
-
 fn debug_exercises(app: AppHandle) -> Result<Vec<Prescription>, String> {
     app.state::<Runtime>().require_debug()?;
     detector::debug_exercise_options()

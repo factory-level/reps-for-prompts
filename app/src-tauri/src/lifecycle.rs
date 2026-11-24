@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use engine::clock::Clock;
-use engine::session::Fact;
+use engine::session::{Fact, Release};
 use engine::types::{Phase, Snapshot};
 use hub_client::outbox::Publication;
 use serde_json::{json, Value};
@@ -65,6 +65,11 @@ pub struct Inner {
 impl std::ops::Deref for Lifecycle {
     type Target = Inner;
     fn deref(&self) -> &Inner { &self.0 }
+}
+
+/// The coding interval the timer returns to after a break.
+fn work_minutes(core: &Core) -> f64 {
+    core.store.setting("work_minutes", "25").parse().unwrap_or(25.)
 }
 
 fn new_session_id() -> String {
@@ -178,6 +183,16 @@ impl Lifecycle {
             facts.extend(core.session.confirm_weight(weight, today));
             Ok(facts)
         })
+    }
+
+    /// Leave the lock cycle without credit and go back to coding. The
+    /// emergency escape: available in every phase, never rejected.
+    pub fn cancel(&self) -> Snapshot {
+        self.step(|core, now, _| {
+            let facts = core.session.release(Release::Cancel, now);
+            core.session.configure_timer(work_minutes(core), now);
+            Ok(facts)
+        }).unwrap_or_else(|_| self.snapshot())
     }
 
     pub(crate) fn persist(&self, core: &mut Core) -> Snapshot {
@@ -507,5 +522,45 @@ mod tests {
         assert_eq!(rig.verified(), Vec::<bool>::new());
         assert!(rig.active());
         assert_eq!(rig.life.snapshot().phase, Phase::WorkoutActive);
+    }
+
+    #[test]
+    fn cancel_mid_set_releases_the_camera_and_ends_the_session() {
+        let rig = rig(LIFTS, Some(FakeHub::new(vec![])), false);
+        start(&rig);
+        let snapshot = rig.life.cancel();
+        assert_eq!(snapshot.phase, Phase::Coding);
+        assert_eq!(snapshot.remaining_seconds, 1500.0);
+        assert!(!rig.active());
+        assert_eq!(rig.calls().last().unwrap(), "disable:workout");
+        assert_eq!(rig.types(), [&LOCK[..], &[
+            "detector_started", "desktop_unlocked", "coding_period_started", "detector_stopped",
+        ]].concat());
+        let published = rig.effects.0.lock().unwrap().published.clone();
+        let Publication::Event(unlocked) = &published[6] else { panic!() };
+        assert_eq!(unlocked["payload"], json!({"reason": "cancel"}));
+        // The session closes with the return to coding.
+        assert!(rig.life.gate.lock().unwrap().session_id.is_none());
+        assert_eq!(rig.verified(), Vec::<bool>::new());
+
+        // Nothing to cancel while coding: no events, no hub call.
+        let (published, calls) = (rig.wire().len(), rig.calls().len());
+        assert_eq!(rig.life.cancel().phase, Phase::Coding);
+        assert_eq!((rig.wire().len(), rig.calls().len()), (published, calls));
+    }
+
+    #[test]
+    fn each_lock_cycle_gets_its_own_session_id() {
+        let rig = rig(LIFTS, Some(FakeHub::new(vec![])), false);
+        start(&rig);
+        rig.life.finish(95.0, true).unwrap();
+        // From Unlocked, cancel is just the return to coding.
+        assert_eq!(rig.life.cancel().phase, Phase::Coding);
+        start(&rig);
+        let sessions: Vec<Option<String>> = rig.wire().into_iter()
+            .filter(|(event_type, _)| event_type == "workout_prescribed").map(|(_, session)| session).collect();
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions[0].is_some() && sessions[1].is_some());
+        assert_ne!(sessions[0], sessions[1]);
     }
 }

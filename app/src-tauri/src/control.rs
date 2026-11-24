@@ -102,7 +102,7 @@ fn dispatch(app:&AppHandle, command:Command)->Result<serde_json::Value,String>{
   Command::Start=>{stop_preview(app);daily::reminder_action(app.clone(),"start".into(),None)?;if let Some(w)=app.get_webview_window("main"){let _=w.show();let _=w.unminimize();}},
   Command::Snooze{minutes}=>daily::reminder_action(app.clone(),"snooze".into(),Some(minutes))?,
   Command::Skip=>daily::reminder_action(app.clone(),"skip".into(),None)?,
-  Command::Cancel=>{stop_preview(app);crate::stop_debug_process(app);crate::emergency_escape(app.clone(),app.state::<Lifecycle>());},
+  Command::Cancel=>{stop_preview(app);crate::stop_debug_process(app);app.state::<Lifecycle>().cancel();},
   Command::Finish{weight,honor}=>{app.state::<Lifecycle>().finish(weight,honor)?;},
   Command::Settings{minutes,lock_mode}=>{
    if lock_mode==Some(true){return Err("CLI-only displays cannot take over the terminal; lock mode must stay off".into());}
