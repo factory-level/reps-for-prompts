@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use engine::clock::{Clock, SystemClock};
 use engine::plan::DailyPlan;
-use engine::session::Session;
+use engine::session::{Release, Session};
 use engine::store::{default_continuous_pool, Store};
 use engine::timer::CodingTimer;
 use engine::types::{ExerciseKind, Phase, Prescription, Progress, Snapshot};
@@ -228,7 +228,7 @@ fn shutdown_runtime(app: &AppHandle) {
 /// Emergency escape remains available in enforced Workout mode.
 fn emergency_escape(app: AppHandle, state: State<SharedCore>) -> Snapshot {
     let mut core = state.lock().unwrap();
-    core.session.debug_force_coding(SystemClock.now());
+    let _ = core.session.release(Release::Cancel, SystemClock.now());
     let minutes = core.store.setting("work_minutes", "25").parse().unwrap_or(25.);
     core.session.configure_timer(minutes, SystemClock.now());
     let snap = persist_and_snapshot(&mut core);
@@ -274,9 +274,13 @@ fn debug_mode(app: AppHandle, state: State<SharedCore>, mode: String, exercise: 
     let workout = mode == "workout";
     if workout {
         if let Some(rx) = selected { core.session.debug_start_exercise(rx); }
-        else { core.session.debug_force_workout(clock.now(), &clock.today()); }
+        else {
+            // Restart from any phase: drop the current set, then take the next.
+            let _ = core.session.release(Release::Cancel, clock.now());
+            let _ = core.session.start_workout(&clock.today());
+        }
     } else {
-        core.session.debug_force_coding(clock.now());
+        let _ = core.session.release(Release::Cancel, clock.now());
     }
     let snap = persist_and_snapshot(&mut core);
     drop(core);
@@ -709,7 +713,7 @@ pub fn run() {
                         if !warn {daily::notify("Time for a little movement. Start your next workout from the terminal: rfp start".into());}
                         emit_snapshot(&handle, &snap);
                         if handle.state::<Runtime>().enforces_windows() {
-                            core.session.begin_workout();
+                            let _ = core.session.start_workout(&today);
                             snap = persist_and_snapshot(&mut core);
                             enable_metric_for(&handle, &snap);
                         } else if let Some(window) = handle.get_webview_window("main") {

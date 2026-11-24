@@ -94,38 +94,70 @@ impl Session {
         self.timer.configure(minutes * 60.0, now);
     }
 
-    #[must_use]
-    pub fn tick(&mut self, now: f64, today: &str) -> Vec<Fact> {
-        if self.phase == Phase::Coding && self.timer.expired(now) {
-            self.timer.stop();
-            self.progress = None;
-            if let Some(plan) = self.plan.as_mut() {
+    /// Prescribe the next set and lock. None — and no state change — when
+    /// nothing is owed (the day's plan is complete).
+    fn lock(&mut self, today: &str) -> Option<Prescription> {
+        let rx = match self.plan.as_mut() {
+            Some(plan) => {
                 plan.roll_date(today);
-                match plan.prescribe() {
-                    Some(rx) => {
-                        self.prescription = Some(rx.clone());
-                        self.phase = Phase::ExerciseRequired;
-                        return vec![Fact::Locked(rx)];
-                    }
-                    // Day complete: don't lock — re-arm the timer and stay coding.
-                    None => {
-                        self.prescription = None;
-                        self.timer.start(now);
-                        return vec![];
-                    }
-                }
+                plan.prescribe()
             }
-            self.prescription = self.workout.prescribe(today);
-            self.phase = Phase::ExerciseRequired;
-            return self.prescription.clone().map(Fact::Locked).into_iter().collect();
-        }
-        vec![]
+            None => self.workout.prescribe(today),
+        }?;
+        self.timer.stop();
+        self.progress = None;
+        self.verified = true;
+        self.prescription = Some(rx.clone());
+        self.phase = Phase::ExerciseRequired;
+        Some(rx)
     }
 
-    pub fn begin_workout(&mut self) {
-        if self.phase == Phase::ExerciseRequired && self.prescription.is_some() {
-            self.phase = Phase::WorkoutActive;
+    #[must_use]
+    pub fn tick(&mut self, now: f64, today: &str) -> Vec<Fact> {
+        if self.phase != Phase::Coding || !self.timer.expired(now) {
+            return vec![];
         }
+        match self.lock(today) {
+            Some(rx) => vec![Fact::Locked(rx)],
+            // Day complete: don't lock — re-arm the timer and stay coding.
+            None => {
+                self.timer.start(now);
+                vec![]
+            }
+        }
+    }
+
+    /// Start the set: the one already prescribed (ExerciseRequired), or — an
+    /// early start from Coding — the next one owed. Empty when a set is already
+    /// under way or nothing is owed today.
+    #[must_use]
+    pub fn start_workout(&mut self, today: &str) -> Vec<Fact> {
+        let mut facts = Vec::new();
+        if self.phase == Phase::Coding {
+            facts.extend(self.lock(today).map(Fact::Locked));
+        }
+        if self.phase == Phase::ExerciseRequired {
+            self.phase = Phase::WorkoutActive;
+            facts.push(Fact::Started);
+        }
+        facts
+    }
+
+    /// Leave the lock cycle without completion credit and re-arm the coding
+    /// timer. Nothing to release while Coding; from Unlocked the set already
+    /// completed, so this is just the return to coding.
+    #[must_use]
+    pub fn release(&mut self, why: Release, now: f64) -> Vec<Fact> {
+        let mut facts = match self.phase {
+            Phase::Coding => return vec![],
+            Phase::Unlocked => vec![],
+            _ => vec![Fact::Released(why)],
+        };
+        self.prescription = None;
+        self.progress = None;
+        self.verified = true;
+        facts.extend(self.start(now, ""));
+        facts
     }
 
     #[must_use]
@@ -203,28 +235,7 @@ impl Session {
         if self.phase != Phase::Unlocked {
             return vec![];
         }
-        self.prescription = None;
-        self.progress = None;
-        self.start(now, "")
-    }
-
-    /// DEBUG: jump straight into an active set from any phase — skips the coding
-    /// timer and the lock so detection can be exercised on demand. Prescribes
-    /// the next incomplete item (plan) or the rotation's next (legacy).
-    pub fn debug_force_workout(&mut self, now: f64, today: &str) {
-        self.timer.stop();
-        self.progress = None;
-        let _ = now;
-        let rx = if let Some(plan) = self.plan.as_mut() {
-            plan.roll_date(today);
-            plan.prescribe()
-        } else {
-            self.workout.prescribe(today)
-        };
-        if let Some(rx) = rx {
-            self.prescription = Some(rx);
-            self.phase = Phase::WorkoutActive;
-        }
+        self.release(Release::Cancel, now) // from Unlocked the reason is unused
     }
 
     /// Start a manually selected detector test, independent of the daily plan.
@@ -237,16 +248,6 @@ impl Session {
         self.verified = false;
         self.prescription = Some(prescription);
         self.phase = Phase::WorkoutActive;
-    }
-
-    /// DEBUG: return to the coding phase from any phase (the caller releases the
-    /// camera). Re-arms the coding timer.
-    pub fn debug_force_coding(&mut self, now: f64) {
-        self.prescription = None;
-        self.progress = None;
-        self.verified = true;
-        self.phase = Phase::Coding;
-        self.timer.start(now);
     }
 
     pub fn take_pending_record(&mut self) -> Option<SetRecord> {
@@ -294,9 +295,13 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
+    use super::{Fact, Release};
+    use crate::plan::DailyPlan;
     use crate::timer::CodingTimer;
-    use crate::types::{ExerciseDef, ExerciseKind, Phase, Progress};
+    use crate::types::{ExerciseDef, ExerciseKind, Phase, Prescription, Progress};
     use crate::workout::WorkoutEngine;
+
+    const DAY: &str = "2026-07-19";
 
     fn session() -> super::Session {
         let rotation = vec![ExerciseDef {
@@ -320,54 +325,53 @@ mod tests {
         Progress { value: v, unit: unit.into(), satisfied: true }
     }
 
+    fn bench() -> Prescription {
+        Prescription { exercise: "bench".into(), kind: ExerciseKind::Rep, target_reps: 10, target_seconds: 0.0, default_weight: 45.0 }
+    }
+
     #[test]
-    fn full_lift_cycle() {
+    fn full_lift_cycle_reports_each_fact_once() {
         let mut s = session();
-        let _ = s.start(0.0, "2026-07-19");
-        assert_eq!(s.snapshot(0.0).phase, Phase::Coding);
+        assert_eq!(s.start(0.0, DAY), vec![Fact::CodingStarted]);
+        assert_eq!(s.tick(359.0, DAY), vec![]);
+        assert_eq!(s.tick(360.0, DAY), vec![Fact::Locked(bench())]);
+        assert_eq!(s.snapshot(360.0).phase, Phase::ExerciseRequired);
+        assert_eq!(s.tick(361.0, DAY), vec![]); // locked: no second lock
 
-        assert!(s.tick(359.0, "2026-07-19").is_empty());
-        assert!(!s.tick(360.0, "2026-07-19").is_empty());
-        let snap = s.snapshot(360.0);
-        assert_eq!(snap.phase, Phase::ExerciseRequired);
-        assert_eq!(snap.prescription.as_ref().unwrap().exercise, "bench");
-
-        s.begin_workout();
-        assert_eq!(s.snapshot(361.0).phase, Phase::WorkoutActive);
-
-        let _ = s.report_progress(Progress { value: 3.0, unit: "reps".into(), satisfied: false });
+        assert_eq!(s.start_workout(DAY), vec![Fact::Started]);
+        assert_eq!(s.start_workout(DAY), vec![]); // already under way
+        assert_eq!(s.report_progress(Progress { value: 3.0, unit: "reps".into(), satisfied: false }), vec![]);
         assert_eq!(s.snapshot(400.0).phase, Phase::WorkoutActive);
-
-        let _ = s.report_progress(done("reps", 10.0));
+        // a lift waits for the weight before it counts as completed
+        assert_eq!(s.report_progress(done("reps", 10.0)), vec![]);
         assert_eq!(s.snapshot(401.0).phase, Phase::WeightConfirmation);
 
-        let _ = s.confirm_weight(145.0, "2026-07-19");
+        assert_eq!(
+            s.confirm_weight(145.0, DAY),
+            vec![Fact::WeightLogged { exercise: "bench".into(), weight: 145.0 }, Fact::Completed],
+        );
         let rec = s.take_pending_record().unwrap();
-        assert_eq!(rec.weight, 145.0);
-        assert_eq!(rec.reps, 10);
-        assert!(rec.verified);
+        assert_eq!((rec.weight, rec.reps, rec.verified), (145.0, 10, true));
         assert_eq!(s.snapshot(402.0).phase, Phase::Unlocked);
 
-        let _ = s.resume_coding(500.0);
+        assert_eq!(s.resume_coding(500.0), vec![Fact::CodingStarted]);
         let snap = s.snapshot(500.0);
         assert_eq!(snap.phase, Phase::Coding);
         assert_eq!(snap.remaining_seconds, 360.0);
         assert_eq!(snap.capacity_used, 1);
+        assert!(snap.prescription.is_none());
     }
 
     #[test]
-    fn continuous_skips_weight_confirmation() {
+    fn continuous_set_completes_without_weight_confirmation() {
         let mut s = session();
         // force capacity spent so prescription is continuous
-        s.workout_mut_for_test().restore(0, 20, "2026-07-19");
-        let _ = s.start(0.0, "2026-07-19");
-        let _ = s.tick(360.0, "2026-07-19");
-        assert_eq!(
-            s.snapshot(360.0).prescription.as_ref().unwrap().kind,
-            ExerciseKind::Continuous
-        );
-        s.begin_workout();
-        let _ = s.report_progress(done("seconds", 60.0));
+        s.workout_mut_for_test().restore(0, 20, DAY);
+        let _ = s.start(0.0, DAY);
+        let locked = s.tick(360.0, DAY);
+        assert!(matches!(&locked[..], [Fact::Locked(rx)] if rx.kind == ExerciseKind::Continuous));
+        assert_eq!(s.start_workout(DAY), vec![Fact::Started]);
+        assert_eq!(s.report_progress(done("seconds", 60.0)), vec![Fact::Completed]);
         assert_eq!(s.snapshot(361.0).phase, Phase::Unlocked);
         let rec = s.take_pending_record().unwrap();
         assert_eq!(rec.exercise, "jumprope");
@@ -375,107 +379,136 @@ mod tests {
     }
 
     #[test]
-    fn guards_ignore_wrong_phase_calls() {
+    fn early_start_locks_and_starts_in_one_step() {
         let mut s = session();
-        let _ = s.start(0.0, "2026-07-19");
-        s.begin_workout(); // Coding: no-op
-        assert_eq!(s.snapshot(1.0).phase, Phase::Coding);
-        assert!(s.confirm_weight(100.0, "2026-07-19").is_empty());
-        let _ = s.report_progress(done("reps", 10.0)); // no active workout: no-op
-        assert_eq!(s.snapshot(2.0).phase, Phase::Coding);
+        let _ = s.start(0.0, DAY);
+        assert_eq!(s.start_workout(DAY), vec![Fact::Locked(bench()), Fact::Started]);
+        assert_eq!(s.snapshot(1.0).phase, Phase::WorkoutActive);
+        // the coding timer is stopped while a set is owed
+        assert_eq!(s.snapshot(10_000.0).remaining_seconds, 360.0);
+        assert_eq!(s.tick(10_000.0, DAY), vec![]);
     }
 
     #[test]
-    fn timer_stops_while_locked() {
+    fn release_from_each_phase() {
+        let coding = vec![Fact::CodingStarted];
+        let released = |why| vec![Fact::Released(why), Fact::CodingStarted];
+
         let mut s = session();
-        let _ = s.start(0.0, "2026-07-19");
-        let _ = s.tick(360.0, "2026-07-19");
-        // long workout: coding timer must not be running
-        assert_eq!(s.snapshot(10_000.0).remaining_seconds, 360.0);
+        let _ = s.start(0.0, DAY);
+        assert_eq!(s.release(Release::Skip, 1.0), vec![]); // Coding: nothing to release
+
+        let _ = s.tick(360.0, DAY);
+        assert_eq!(s.release(Release::Snooze, 361.0), released(Release::Snooze)); // ExerciseRequired
+        let snap = s.snapshot(361.0);
+        assert_eq!((snap.phase, snap.remaining_seconds), (Phase::Coding, 360.0));
+        assert!(snap.prescription.is_none() && snap.progress.is_none());
+
+        let _ = s.start_workout(DAY);
+        assert_eq!(s.release(Release::Cancel, 362.0), released(Release::Cancel)); // WorkoutActive
+
+        let _ = s.start_workout(DAY);
+        let _ = s.report_progress(done("reps", 10.0));
+        assert_eq!(s.release(Release::Cancel, 363.0), released(Release::Cancel)); // WeightConfirmation
+        assert_eq!(s.snapshot(363.0).capacity_used, 0); // no completion credit
+
+        let _ = s.start_workout(DAY);
+        let _ = s.report_progress(done("reps", 10.0));
+        let _ = s.confirm_weight(45.0, DAY);
+        assert_eq!(s.release(Release::Cancel, 364.0), coding); // Unlocked: already completed
+        assert_eq!(s.snapshot(364.0).capacity_used, 1);
+    }
+
+    #[test]
+    fn wrong_phase_calls_are_rejected() {
+        let mut s = session();
+        let _ = s.start(0.0, DAY);
+        assert_eq!(s.honor_complete(), vec![]);
+        assert_eq!(s.confirm_weight(100.0, DAY), vec![]);
+        assert_eq!(s.report_progress(done("reps", 10.0)), vec![]);
+        assert_eq!(s.resume_coding(1.0), vec![]);
+        let snap = s.snapshot(2.0);
+        assert_eq!(snap.phase, Phase::Coding);
+        assert!(snap.progress.is_none());
+
+        let _ = s.tick(360.0, DAY);
+        assert_eq!(s.honor_complete(), vec![]); // locked but not started
+        assert_eq!(s.snapshot(360.0).phase, Phase::ExerciseRequired);
+    }
+
+    #[test]
+    fn honor_is_reported_and_recorded_unverified() {
+        let mut s = session();
+        let _ = s.start(0.0, DAY);
+        let _ = s.start_workout(DAY);
+        assert_eq!(s.honor_complete(), vec![Fact::HonorUsed]); // lift: weight still to confirm
+        let _ = s.confirm_weight(45.0, DAY);
+        assert!(!s.take_pending_record().unwrap().verified);
+        // the next set is verified again by default
+        let _ = s.resume_coding(361.0);
+        let _ = s.start_workout(DAY);
+        let _ = s.report_progress(done("reps", 10.0));
+        let _ = s.confirm_weight(50.0, DAY);
+        assert!(s.take_pending_record().unwrap().verified);
+
+        // a timed set has no weight step, so honor completes it immediately
+        let mut s = session();
+        s.workout_mut_for_test().restore(0, 20, DAY);
+        let _ = s.start(0.0, DAY);
+        let _ = s.start_workout(DAY);
+        assert_eq!(s.honor_complete(), vec![Fact::HonorUsed, Fact::Completed]);
+        assert!(!s.take_pending_record().unwrap().verified);
+    }
+
+    #[test]
+    fn cancelled_honor_does_not_leak_into_the_next_set() {
+        let mut s = session();
+        let _ = s.start(0.0, DAY);
+        let _ = s.start_workout(DAY);
+        assert_eq!(s.honor_complete(), vec![Fact::HonorUsed]);
+        assert_eq!(s.release(Release::Cancel, 2.0), vec![Fact::Released(Release::Cancel), Fact::CodingStarted]);
+        let _ = s.tick(362.0, DAY);
+        let _ = s.start_workout(DAY);
+        let _ = s.report_progress(done("reps", 10.0));
+        let _ = s.confirm_weight(45.0, DAY);
+        assert!(s.take_pending_record().unwrap().verified);
+    }
+
+    #[test]
+    fn nothing_starts_or_locks_on_a_completed_day() {
+        let mut s = session();
+        s.set_plan(DailyPlan::from_routine_json(r#"{"lifts":[{"exercise":"squat","sets":1,"reps":5}]}"#, DAY).unwrap());
+        let _ = s.start(0.0, DAY);
+        assert!(matches!(&s.start_workout(DAY)[..], [Fact::Locked(_), Fact::Started]));
+        let _ = s.report_progress(done("reps", 5.0));
+        let _ = s.confirm_weight(45.0, DAY);
+        let _ = s.resume_coding(10.0);
+
+        assert_eq!(s.start_workout(DAY), vec![]);
+        let snap = s.snapshot(11.0);
+        assert_eq!(snap.phase, Phase::Coding);
+        assert_eq!(snap.remaining_seconds, 359.0); // the coding timer keeps running
+        assert_eq!(s.tick(370.0, DAY), vec![]); // expiry re-arms instead of locking
+        assert_eq!(s.snapshot(370.0).remaining_seconds, 360.0);
+        // tomorrow owes a set again
+        assert!(matches!(&s.tick(730.0, "2026-07-20")[..], [Fact::Locked(_)]));
     }
 
     #[test]
     fn selected_debug_exercise_replaces_progress_and_uses_timed_target() {
         let mut s = session();
-        s.debug_force_workout(0.0, "2026-09-15");
+        let _ = s.start_workout("2026-09-15");
         let _ = s.report_progress(Progress { value: 3.0, unit: "reps".into(), satisfied: false });
-        s.debug_start_exercise(crate::types::Prescription { exercise: "jumprope".into(), kind: ExerciseKind::Continuous,
+        s.debug_start_exercise(Prescription { exercise: "jumprope".into(), kind: ExerciseKind::Continuous,
             target_reps: 0, target_seconds: 60.0, default_weight: 0.0 });
         let snap = s.snapshot(1000.0);
         assert_eq!(snap.phase, Phase::WorkoutActive);
         assert!(snap.progress.is_none());
         assert_eq!(snap.prescription.unwrap().exercise, "jumprope");
-        assert!(s.tick(10000.0, "2026-09-15").is_empty());
-        let _ = s.report_progress(done("seconds", 60.0));
+        assert_eq!(s.tick(10000.0, "2026-09-15"), vec![]);
+        assert_eq!(s.report_progress(done("seconds", 60.0)), vec![Fact::Completed]);
         let record = s.take_pending_record().unwrap();
         assert_eq!(record.exercise, "jumprope");
         assert_eq!(record.seconds, 60.0);
-    }
-
-    #[test]
-    fn debug_toggle_switches_between_coding_and_workout() {
-        let mut s = session();
-        let _ = s.start(0.0, "2026-07-19");
-        assert_eq!(s.snapshot(0.0).phase, Phase::Coding);
-        // Force into a set without waiting out the timer.
-        s.debug_force_workout(1.0, "2026-07-19");
-        let snap = s.snapshot(1.0);
-        assert_eq!(snap.phase, Phase::WorkoutActive);
-        assert!(snap.prescription.is_some());
-        // Force back to coding.
-        s.debug_force_coding(2.0);
-        assert_eq!(s.snapshot(2.0).phase, Phase::Coding);
-        assert!(s.snapshot(2.0).prescription.is_none());
-    }
-
-    #[test]
-    fn honor_mode_records_are_unverified() {
-        let mut s = session();
-        let _ = s.start(0.0, "2026-07-19");
-        let _ = s.tick(360.0, "2026-07-19");
-        s.begin_workout();
-        assert!(!s.honor_complete().is_empty()); // camera failed: user pressed Done
-        let _ = s.confirm_weight(45.0, "2026-07-19");
-        let rec = s.take_pending_record().unwrap();
-        assert!(!rec.verified);
-    }
-
-    #[test]
-    fn verification_resets_after_each_set() {
-        let mut s = session();
-        let _ = s.start(0.0, "2026-07-19");
-        let _ = s.tick(360.0, "2026-07-19");
-        s.begin_workout();
-        assert!(!s.honor_complete().is_empty());
-        let _ = s.confirm_weight(45.0, "2026-07-19");
-        s.take_pending_record();
-        let _ = s.resume_coding(361.0);
-        // next workout is verified again by default
-        let _ = s.tick(721.0, "2026-07-19");
-        s.begin_workout();
-        let _ = s.report_progress(done("reps", 10.0));
-        let _ = s.confirm_weight(50.0, "2026-07-19");
-        let rec = s.take_pending_record().unwrap();
-        assert!(rec.verified);
-    }
-
-    #[test]
-    fn honor_outside_active_workout_is_rejected_and_cancel_restores_verification() {
-        let mut s = session();
-        let _ = s.start(0.0, "2026-07-19");
-        assert!(s.honor_complete().is_empty());
-        assert!(s.verified);
-        assert_eq!(s.snapshot(0.0).phase, Phase::Coding);
-        assert!(s.snapshot(0.0).progress.is_none());
-
-        s.debug_force_workout(1.0, "2026-07-19");
-        assert!(!s.honor_complete().is_empty());
-        s.debug_force_coding(2.0); // cancelled: the honor must not leak into the next set
-        let _ = s.tick(362.0, "2026-07-19");
-        s.begin_workout();
-        let _ = s.report_progress(done("reps", 10.0));
-        let _ = s.confirm_weight(45.0, "2026-07-19");
-        let rec = s.take_pending_record().unwrap();
-        assert!(rec.verified);
     }
 }
