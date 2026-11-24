@@ -20,15 +20,6 @@ jobs:
         working-directory: vision
       - run: uv run --frozen --extra cv python -m pytest
         working-directory: vision
-      - run: uv run --frozen --extra cv python scripts/fetch_fixtures.py --benchmark
-        working-directory: vision
-      - run: uv run --frozen --extra cv python scripts/benchmark_movements.py --output ../qualification/public-video.json
-        working-directory: vision
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: public-video-regression
-          path: qualification/
       # The app currently commits package-lock.json; use its existing lock.
       - run: npm ci
         working-directory: app
@@ -42,6 +33,29 @@ jobs:
           # Unit/contract tests do not package the separately staged hub SDK.
           # The qualification runner verifies the real bundle locally.
           TAURI_CONFIG: '{"bundle":{"resources":null}}'
+      # Last, because it depends on a third-party host: the benchmark videos come
+      # from Wikimedia, which rate-limits CI runners. Cache them (the script
+      # verifies checksums and skips files already present), and save even after
+      # a failed run so a partial download is not repeated.
+      - uses: actions/cache/restore@v4
+        id: fixtures
+        with:
+          path: vision/tests/fixtures/videos
+          key: video-fixtures-${{ hashFiles('vision/tests/fixtures/videos/benchmark.json', 'vision/scripts/fetch_fixtures.py') }}
+      - run: uv run --frozen --extra cv python scripts/fetch_fixtures.py --benchmark
+        working-directory: vision
+      - uses: actions/cache/save@v4
+        if: always() && steps.fixtures.outputs.cache-hit != 'true'
+        with:
+          path: vision/tests/fixtures/videos
+          key: ${{ steps.fixtures.outputs.cache-primary-key }}
+      - run: uv run --frozen --extra cv python scripts/benchmark_movements.py --output ../qualification/public-video.json
+        working-directory: vision
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: public-video-regression
+          path: qualification/
   activity-site:
     runs-on: ubuntu-24.04
     services:
