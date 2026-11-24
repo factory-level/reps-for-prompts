@@ -8,7 +8,11 @@
 
 Once the day's plan is complete, the timer no longer requests more sets that day.
 If detection is unavailable, honor-mode completion is unverified; it is not
-camera evidence. Debug mode offers manual test controls through
+camera evidence. During an active set the screen shows **Camera down · finish
+via rfp finish --honor** while the camera path is not working: the hub failed to
+start or was lost, the detector could not start or stopped, or the camera was
+unplugged. It clears by itself when frames return (for example, the camera is
+plugged back in), and `rfp finish --honor` works either way. Debug mode offers manual test controls through
 [`rfp debug`](../debug-mode.md).
 
 `rfp start` begins the next set early, without waiting for the timer. Once the
