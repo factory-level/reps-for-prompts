@@ -116,11 +116,8 @@ mod isolation_tests {
         let runtime = Runtime::load(home.clone()).unwrap();
         let mut debug = crate::build_core(&runtime.session_home);
         debug.session.debug_force_workout(SystemClock.now(), &SystemClock.today());
-        debug.session.report_progress(Progress { value: 999.0, unit: "reps".into(), satisfied: true });
-        if let Some(record) = debug.session.confirm_weight(25.0, &SystemClock.today()) {
-            debug.store.record_set(&record).unwrap();
-            debug.session.take_pending_record();
-        }
+        let _ = debug.session.report_progress(Progress { value: 999.0, unit: "reps".into(), satisfied: true });
+        let _ = debug.session.confirm_weight(25.0, &SystemClock.today());
         crate::persist_and_snapshot(&mut debug);
         assert_eq!(debug.store.history(100).unwrap().len(), 1);
         assert_eq!(normal.store.history(100).unwrap().len(), before);

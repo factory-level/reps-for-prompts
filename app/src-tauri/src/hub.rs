@@ -600,7 +600,7 @@ fn pump_events(app: AppHandle, rx: std::sync::mpsc::Receiver<VisionEvent>) {
                 }
                 let core_state = app.state::<crate::SharedCore>();
                 let mut core = core_state.lock().unwrap();
-                core.session.report_progress(Progress { value, unit, satisfied });
+                let _ = core.session.report_progress(Progress { value, unit, satisfied });
                 let snap = crate::persist_and_snapshot(&mut core);
                 drop(core);
                 crate::emit_snapshot(&app, &snap);
@@ -792,7 +792,7 @@ pub(crate) fn disable_metric_now(app: &AppHandle) {
 pub fn honor_complete(app: &AppHandle) -> Result<engine::types::Snapshot, String> {
     let core_state = app.state::<crate::SharedCore>();
     let mut core = core_state.lock().unwrap();
-    if !core.session.honor_complete() {
+    if core.session.honor_complete().is_empty() {
         return Err("No active workout to complete".into());
     }
     // Honor mode is visible in durable history, never a silent degradation.

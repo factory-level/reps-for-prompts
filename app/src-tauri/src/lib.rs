@@ -298,7 +298,7 @@ fn simulate_progress(
     app.state::<Runtime>().require_debug()?;
     let mut core = state.lock().unwrap();
     let unit = "reps".to_string();
-    core.session.report_progress(Progress { value, unit, satisfied });
+    let _ = core.session.report_progress(Progress { value, unit, satisfied });
     let snap = persist_and_snapshot(&mut core);
     drop(core);
     if satisfied { hub::disable_metric_async(&app); }
@@ -309,16 +309,11 @@ fn simulate_progress(
 fn confirm_weight(app: AppHandle, state: State<SharedCore>, weight: f64) -> Snapshot {
     let clock = SystemClock;
     let mut core = state.lock().unwrap();
-    if let Some(rec) = core.session.confirm_weight(weight, &clock.today()) {
-        match core.store.record_set(&rec) {
-            Ok(()) => {}
-            Err(e) => eprintln!("failed to record set: {e}"),
+    // persist_and_snapshot writes the pending record.
+    for fact in core.session.confirm_weight(weight, &clock.today()) {
+        if let engine::session::Fact::WeightLogged { exercise, weight } = fact {
+            hub::queue_event("weight_logged", serde_json::json!({"exercise": exercise, "weight": weight}));
         }
-        core.session.take_pending_record(); // already persisted
-        hub::queue_event(
-            "weight_logged",
-            serde_json::json!({"exercise": rec.exercise, "weight": weight}),
-        );
     }
     let snap = persist_and_snapshot(&mut core);
     drop(core);
@@ -659,7 +654,7 @@ pub fn run() {
                 let clock = SystemClock;
                 let state = handle.state::<SharedCore>();
                 if !handle.state::<Runtime>().is_debug() {
-                    state.lock().unwrap().session.start(clock.now(), &clock.today());
+                    let _ = state.lock().unwrap().session.start(clock.now(), &clock.today());
                 }
             }
             std::thread::spawn(move || {
@@ -707,7 +702,7 @@ pub fn run() {
                         let changed={let state=handle.state::<control::SharedDisplay>();let mut display=state.lock().unwrap();display.notice.take().map(|_|display.clone())};
                         if let Some(display)=changed{let _=handle.emit("display-state",display);}
                     }
-                    let locked_now = !handle.state::<Runtime>().is_debug() && can_remind && core.session.tick(now, &today);
+                    let locked_now = !handle.state::<Runtime>().is_debug() && can_remind && !core.session.tick(now, &today).is_empty();
                     let mut snap = core.session.snapshot(now);
                     if locked_now {
                         // Show the passive reminder; CLI starts the camera.
@@ -725,7 +720,7 @@ pub fn run() {
                     if !handle.state::<Runtime>().is_debug() && snap.phase == Phase::Unlocked {
                         let since = *unlocked_since.get_or_insert(now);
                         if now - since >= 3.0 {
-                            core.session.resume_coding(now);
+                            let _ = core.session.resume_coding(now);
                             let minutes = core.store.setting("work_minutes", "25").parse().unwrap_or(25.);
                             core.session.configure_timer(minutes, now);
                             snap = persist_and_snapshot(&mut core);
