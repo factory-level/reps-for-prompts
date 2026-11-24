@@ -1,119 +1,58 @@
 import { invoke } from "@tauri-apps/api/core";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { fireEvent, render, screen } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
 import { Screen } from "./Screen";
-import type { Snapshot } from "./snapshot";
+import { app, base } from "./fixtures";
 
-vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(() => Promise.resolve()) }));
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(() => Promise.resolve(true)) }));
 
-const base: Snapshot = {
-  phase: "CODING",
-  remainingSeconds: 359,
-  prescription: null,
-  progress: null,
-  capacityUsed: 0,
-  capacityLimit: 20,
-  rotation: [],
-  pointer: 0,
-  day: {
-    items: [{ name: "jumprope", label: "Jump rope", kind: "jumprope", unit: "seconds", target: 60, done: 0, total: 2 }],
-    setsDone: 7,
-    setsTotal: 31,
-    complete: false,
-  },
-};
+const press = { exercise: "overhead", kind: "REP", targetReps: 12, targetSeconds: 0, defaultWeight: 0 } as const;
 
-describe("Screen", () => {
-  it("CODING shows CODE and the countdown", () => {
-    render(<Screen snapshot={base} variant="primary" />);
+describe("gym monitor", () => {
+  it("coding shows CODE, the countdown and the next exercise", () => {
+    render(<Screen snapshot={base} app={app} />);
     expect(screen.getByText("CODE")).toBeInTheDocument();
-    expect(screen.getByText(/05:59/)).toBeInTheDocument();
+    expect(screen.getByText("05:59")).toBeInTheDocument();
+    expect(screen.getByText(/Next: Dumbbell press · 12 reps/)).toBeInTheDocument();
   });
-
-  it("primary offers a gentle reminder before starting the camera", () => {
-    render(<Screen snapshot={{ ...base, phase: "EXERCISE_REQUIRED" }} variant="primary" />);
-    expect(screen.getByText("WORKOUT")).toBeInTheDocument();
-    expect(screen.queryByRole("img", { name: "locked" })).not.toBeInTheDocument();
-    expect(screen.getByText(/start when ready/)).toBeInTheDocument();
+  it("a live set shows done / target as the biggest number", () => {
+    render(<Screen snapshot={{ ...base, phase: "WORKOUT_ACTIVE", prescription: press, progress: { value: 8.4, unit: "reps", satisfied: false } }} app={app} />);
+    expect(screen.getByText("08 / 12")).toBeInTheDocument();
+    expect(screen.getByText("DUMBBELL PRESS")).toBeInTheDocument();
   });
-
-  it("gym shows the live count in the prescription's unit", () => {
-    const snap: Snapshot = {
-      ...base,
-      phase: "WORKOUT_ACTIVE",
-      prescription: { exercise: "jumprope", kind: "CONTINUOUS", targetReps: 0, targetSeconds: 60, defaultWeight: 0 },
-      progress: { value: 42.7, unit: "seconds", satisfied: false },
-    };
-    render(<Screen snapshot={snap} variant="gym" />);
-    expect(screen.getByText("Jump rope")).toBeInTheDocument();
-    expect(screen.getByText("042")).toBeInTheDocument();
-    expect(screen.getByText("/ 60 sec")).toBeInTheDocument();
+  it("timed sets count in mm:ss", () => {
+    render(<Screen snapshot={{ ...base, phase: "WORKOUT_ACTIVE", prescription: { ...press, kind: "CONTINUOUS", targetReps: 0, targetSeconds: 60 }, progress: { value: 32, unit: "seconds", satisfied: false } }} app={app} />);
+    expect(screen.getByText("00:32 / 01:00")).toBeInTheDocument();
   });
-});
-
-describe("Camera down", () => {
-  const down = { state: "unavailable", reason: "hub not running" } as const;
-  const text = /Camera down · finish via rfp finish --honor/;
-  it("shows while vision is unavailable during an active workout, and clears on recovery", () => {
-    const active: Snapshot = { ...base, phase: "WORKOUT_ACTIVE" };
-    const { rerender } = render(<Screen snapshot={active} variant="primary" vision={down} />);
-    expect(screen.getByText(text)).toBeInTheDocument();
-    rerender(<Screen snapshot={active} variant="primary" vision={{ state: "available" }} />);
-    expect(screen.queryByText(text)).not.toBeInTheDocument();
+  it("without the camera it says manual mode and invents no progress", () => {
+    render(<Screen snapshot={{ ...base, phase: "WORKOUT_ACTIVE", prescription: press }} app={app} vision={{ state: "unavailable", reason: "hub not running" }} />);
+    expect(screen.getByText(/MANUAL MODE/)).toBeInTheDocument();
+    expect(screen.getByText("00 / 12")).toBeInTheDocument();
   });
-  it("stays quiet outside an active workout, while starting, and without a status", () => {
-    const { rerender } = render(<Screen snapshot={base} variant="primary" vision={down} />);
-    expect(screen.queryByText(text)).not.toBeInTheDocument();
-    rerender(<Screen snapshot={{ ...base, phase: "EXERCISE_REQUIRED" }} variant="primary" vision={down} />);
-    expect(screen.queryByText(text)).not.toBeInTheDocument();
-    rerender(<Screen snapshot={{ ...base, phase: "WORKOUT_ACTIVE" }} variant="primary" vision={{ state: "starting" }} />);
-    expect(screen.queryByText(text)).not.toBeInTheDocument();
-    rerender(<Screen snapshot={{ ...base, phase: "WORKOUT_ACTIVE" }} variant="primary" />);
-    expect(screen.queryByText(text)).not.toBeInTheDocument();
+  it("weight entry happens on the computer, not the monitor", () => {
+    const { container } = render(<Screen snapshot={{ ...base, phase: "WEIGHT_CONFIRMATION", prescription: press }} app={app} />);
+    expect(screen.getByText("SET COMPLETE")).toBeInTheDocument();
+    expect(screen.getByText("Return to your computer to log it")).toBeInTheDocument();
+    expect(container.querySelector("input")).toBeNull();
   });
-});
-
-it("Debug stays idle without displaying an automatic countdown", () => {
-  render(<Screen snapshot={base} variant="primary" debug />);
-  expect(screen.getByText("DEBUG")).toBeInTheDocument();
-  expect(screen.getByText(/Idle · start a test/)).toBeInTheDocument();
-  expect(screen.queryByText(/05:59/)).not.toBeInTheDocument();
-});
-it("Debug test progress never claims the screen is locked", () => {
-  render(<Screen snapshot={{ ...base, phase: "WORKOUT_ACTIVE" }} variant="primary" debug />);
-  expect(screen.getByText("TEST WORKOUT")).toBeInTheDocument();
-  expect(screen.queryByRole("img", { name: "locked" })).not.toBeInTheDocument();
-  expect(screen.getByText(/not saved to your workouts/)).toBeInTheDocument();
-});
-
-beforeEach(()=>{vi.mocked(invoke).mockReset();});
-it("starts through the shared CLI action and prevents duplicate submissions",async()=>{
- let finish!:()=>void;
- vi.mocked(invoke).mockImplementation(()=>new Promise<void>(resolve=>{finish=resolve;}));
- render(<Screen snapshot={base} variant="primary"/>);
- const button=screen.getByRole('button',{name:'Start workout'});
- fireEvent.click(button);fireEvent.click(button);
- expect(invoke).toHaveBeenCalledTimes(1);
- expect(invoke).toHaveBeenCalledWith('workout_action',{action:'start',weight:null});
- expect(button).toBeDisabled();finish();
- await waitFor(()=>expect(button).toBeEnabled());
-});
-it("logs fractional weight using the shared finish action",async()=>{
- vi.mocked(invoke).mockResolvedValue({});
- render(<Screen snapshot={{...base,phase:'WEIGHT_CONFIRMATION',prescription:{exercise:'squat',kind:'REP',targetReps:5,targetSeconds:0,defaultWeight:45}}} variant="primary"/>);
- fireEvent.change(screen.getByLabelText('Weight (lb)'),{target:{value:'47.5'}});
- fireEvent.click(screen.getByRole('button',{name:'Log weight'}));
- await waitFor(()=>expect(invoke).toHaveBeenCalledWith('workout_action',{action:'finish',weight:47.5}));
-});
-it("shows action failures so a failed save is not presented as logged",async()=>{
- vi.mocked(invoke).mockRejectedValue('Set is not complete');
- render(<Screen snapshot={{...base,phase:'WEIGHT_CONFIRMATION'}} variant="primary"/>);
- fireEvent.click(screen.getByRole('button',{name:'Log weight'}));
- expect(await screen.findByRole('alert')).toHaveTextContent('Set is not complete');
-});
-it("keeps gym screens and completed routines free of start controls",()=>{
- const {rerender}=render(<Screen snapshot={base} variant="gym"/>);
- expect(screen.queryByRole('button')).not.toBeInTheDocument();
- rerender(<Screen snapshot={{...base,day:{...base.day!,complete:true}}} variant="primary"/>);
- expect(screen.queryByRole('button')).not.toBeInTheDocument();
+  it("setup offers Start session; completion shows the week", () => {
+    const { rerender } = render(<Screen snapshot={{ ...base, phase: "IDLE", day: null }} app={{ ...app, setup: true }} />);
+    expect(screen.getByText("READY")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Start session" }));
+    expect(invoke).toHaveBeenCalledWith("start_session");
+    rerender(<Screen snapshot={{ ...base, phase: "IDLE", day: null }} app={{ ...app, lastCompleted: "Upper A" }} />);
+    expect(screen.getByText("WORKOUT COMPLETE")).toBeInTheDocument();
+    expect(screen.getByText(/3 of 4 this week · next: Lower A/)).toBeInTheDocument();
+  });
+  it("paused and logged states", () => {
+    const { rerender } = render(<Screen snapshot={{ ...base, paused: true }} app={app} />);
+    expect(screen.getByText("PAUSED")).toBeInTheDocument();
+    rerender(<Screen snapshot={{ ...base, phase: "UNLOCKED" }} app={app} />);
+    expect(screen.getByText("SET LOGGED")).toBeInTheDocument();
+  });
+  it("offers a fullscreen toggle on every screen", () => {
+    render(<Screen snapshot={base} app={app} />);
+    fireEvent.click(screen.getByRole("button", { name: "Fullscreen" }));
+    expect(invoke).toHaveBeenCalledWith("toggle_fullscreen");
+  });
 });

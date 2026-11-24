@@ -1,197 +1,110 @@
-/* 16-bit workout OS. Two modes, one composition: title / character / status.
-   CODE = daytime sky + wood; WORKOUT = warm ivory + the RFP orange.
-   Pixel rules: no blur, no radius, hard drop-shadows, `pixelated` sprites. */
+/* The gym monitor. Always dark: CODE = navy, WORKOUT = deep red, COMPLETE =
+   deep green, all type white. One giant word (FitTitle spans the width),
+   then the one dynamic number that matters: time left or reps.
+   Pixel rules: no blur, hard edges. */
 
-/* Baloo 2: round, chunky, bubbly — one variable family for everything. */
 @font-face {
-  font-family: "Baloo 2";
-  src: url("./assets/fonts/baloo2.woff2") format("woff2");
-  font-weight: 400 800;
+  font-family: "Lilita One";
+  src: url("./assets/fonts/lilitaone.woff2") format("woff2");
   font-display: block;
 }
 :root {
-  --orange: #da7756;
-  --orange-deep: #b85c3c;
-  --ivory: #faf9f5;
-  --manilla: #ebdbbc;
-  --sky: #85e1f5;
-  --ink: #4a2b47; /* plum, not black — softer outlines */
+  --navy: #0f1b33; /* CODE */
+  --crimson: #5c0f1a; /* WORKOUT */
+  --forest: #123d22; /* COMPLETE */
   --go: #5cc26b; /* the LOGGED check */
-  --display: "Baloo 2", "Nunito", "Varela Round", sans-serif;
+  --type: #ffffff;
+  --gym-display: "Lilita One", "Nunito", sans-serif;
 }
 
-html,
-body,
-#root {
-  height: 100%;
-  margin: 0;
-}
-body {
-  background: var(--ink);
-  color: var(--ink);
-  font-family: var(--display);
+.gym-root, .gym-root body { height: 100%; margin: 0; }
+.gym {
+  height: 100vh;
   overflow: hidden;
-  user-select: none;
-  -webkit-user-select: none;
+  background: var(--navy);
+  color: var(--type);
+  font-family: var(--gym-display);
 }
 
-/* ---- stage: the three bands ------------------------------------------- */
 .stage {
   position: relative;
-  height: 100vh;
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
   display: grid;
-  grid-template-rows: 30fr 45fr 25fr;
+  grid-template-rows: minmax(0, 1fr) auto;
   text-align: center;
   background: var(--bg-color);
-  image-rendering: pixelated;
 }
-.stage > * {
-  position: relative;
-  z-index: 1;
-}
-/* The whole scene (room + mascot) is one looping clip; its poster is the
-   composited still, so a codec hiccup degrades to a static scene. */
-.stage > .scene {
-  position: absolute;
-  inset: 0;
-  z-index: 0;
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  image-rendering: pixelated;
-}
-.stage.code {
-  --bg-color: var(--sky);
-  --accent: var(--ivory);
-}
-.stage.workout {
-  --bg-color: var(--ivory);
-  --accent: var(--orange);
-}
+.stage.code { --bg-color: var(--navy); }
+.stage.workout { --bg-color: var(--crimson); }
+.stage.done { --bg-color: var(--forest); }
 
-/* Title on a rounded ivory plate so it reads over any scene. */
 .title {
-  margin: 0;
+  margin: 2vh 0 0;
   align-self: center;
   justify-self: center;
-  padding: 1vh 6vh 2vh;
-  border-radius: 6vh;
-  background: var(--ivory);
-  border: 0.8vh solid var(--ink);
-  box-shadow: 1.2vh 1.2vh 0 var(--ink);
-  font-family: var(--display);
-  font-weight: 800;
-  font-size: 14vh;
-  line-height: 1;
+  font-family: var(--gym-display);
+  font-weight: 400;
+  font-size: 18vw; /* FitTitle overrides to span the full width */
+  line-height: 0.85;
   letter-spacing: 0.02em;
-  color: var(--title);
-  text-shadow: 0.04em 0.04em 0 var(--ink);
+  white-space: nowrap;
+  color: var(--type);
   animation: bob 1s steps(2) infinite;
-}
-.stage.code {
-  --title: #2f8fd0; /* deep sky: --sky itself is too pale on ivory */
-}
-.stage.workout {
-  --title: var(--orange);
 }
 @keyframes bob {
   from { transform: translateY(0); }
   to { transform: translateY(-4px); }
 }
 
-.character {
-  align-self: end;
-  justify-self: center;
-  height: 100%;
-  display: flex;
-  align-items: flex-end;
-}
-.sprite {
-  height: 100%;
-  width: auto;
-  image-rendering: pixelated;
-  background: transparent;
-}
-
-/* SNES dialogue box: the status sits in a panel so it layers over the scene
-   like game UI instead of fighting the sprite for the floor. */
 .status {
   align-self: end;
   justify-self: center;
+  min-width: 0;
+  max-width: 100%;
   margin-bottom: 3vh;
-  min-width: 48vw;
-  padding: 2vh 4vh;
+  padding: 1.2vh 4vh;
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 1.5vh;
-  background: var(--ivory);
-  border: 0.8vh solid var(--ink);
-  border-radius: 2vh;
-  box-shadow: 1.2vh 1.2vh 0 var(--ink);
+  gap: 0.6vh;
 }
-.big {
-  font-size: 16vh;
-  font-weight: 800;
+.gym .big {
+  font-size: clamp(40px, 13vh, 30vw);
   line-height: 1;
-  color: var(--orange);
-  text-shadow: 0.04em 0.04em 0 var(--ink);
+  font-variant-numeric: tabular-nums;
 }
-.medium {
-  font-size: 6vh;
-  font-weight: 700;
-  line-height: 1.2;
-  color: var(--orange);
-  text-shadow: 0.04em 0.04em 0 var(--ink);
-}
-.small {
-  font-size: 3.2vh;
-  font-weight: 600;
-  line-height: 1.4;
-  color: var(--ink);
-}
-.lockrow {
-  display: flex;
-  align-items: center;
-  gap: 4vh;
-}
-.padlock {
-  height: 16vh;
-  width: auto;
-  shape-rendering: crispEdges;
+.gym .medium { font-size: clamp(20px, 6vh, 12vw); line-height: 1.15; }
+.gym .small { font-size: clamp(14px, 3.2vh, 6vw); line-height: 1.4; opacity: 0.85; }
+
+.gym-start {
+  margin-top: 1vh;
+  padding: 1.2vh 4vh;
+  font: inherit;
+  font-size: clamp(18px, 4vh, 48px);
+  color: var(--navy);
+  background: var(--type);
+  border: 0;
+  border-radius: 1.2vh;
+  cursor: pointer;
 }
 
-.weight {
-  font-family: var(--display);
-  font-size: 10vh;
-  width: 5ch;
-  padding: 1vh;
-  text-align: center;
-  color: var(--ink);
-  background: var(--ivory);
-  border: 1vh solid var(--ink);
-  box-shadow: 1vh 1vh 0 var(--ink);
-}
-.weight::-webkit-inner-spin-button,
-.weight::-webkit-outer-spin-button {
-  -webkit-appearance: none;
-}
-
-/* ---- LOGGED takeover ---------------------------------------------------- */
+/* ---- SET LOGGED beat ---------------------------------------------------- */
 .takeover {
-  height: 100vh;
+  position: relative;
+  height: 100%;
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
   gap: 5vh;
-  background: var(--ivory);
-  --title: var(--go);
+  background: var(--forest);
 }
 .takeover .check {
   width: 36vh;
   height: 36vh;
-  filter: drop-shadow(1.2vh 1.2vh 0 var(--ink));
+  flex-shrink: 0;
   animation: pop 0.35s cubic-bezier(0.2, 1.6, 0.4, 1) both;
 }
 @keyframes pop {
@@ -199,35 +112,16 @@ body {
   to { transform: scale(1); }
 }
 
-/* ---- quality floor ------------------------------------------------------ */
-:focus-visible {
-  outline: 0.5vh solid var(--ink);
-  outline-offset: 0.5vh;
+/* Out of the grid flow so it never shrinks the giant word. */
+.fullscreen-toggle {
+  position: absolute; top: 12px; right: 12px; z-index: 2;
+  padding: 6px 14px; border: 2px solid var(--type); border-radius: 10px;
+  background: transparent; color: var(--type); font: inherit; font-size: 16px;
+  opacity: 0.6; cursor: pointer;
 }
+.fullscreen-toggle:hover, .fullscreen-toggle:focus-visible { opacity: 1; }
+
+.gym :focus-visible { outline: 3px solid var(--type); outline-offset: 4px; }
 @media (prefers-reduced-motion: reduce) {
-  .title,
-  .takeover .check {
-    animation: none;
-  }
+  .title, .takeover .check { animation: none; }
 }
-
-/* CLI-owned displays: no forms, toolbars, menus, or clickable controls. */
-.passive-app{height:100%;overflow:hidden}.passive-app .stage,.passive-app .takeover{height:100%;min-height:0}
-.passive-preview{height:100%;display:flex;flex-direction:column;align-items:center;background:var(--ivory);padding:20px;text-align:center;overflow:hidden}
-.passive-preview h1{font-size:clamp(28px,5vh,54px);margin:0;color:var(--orange);text-shadow:2px 2px var(--ink)}
-.preview-frames{display:flex;gap:16px;flex:1;min-height:0;max-width:100%;width:100%;align-items:center;justify-content:center}
-.preview-frames figure{margin:0;min-width:0;height:100%;flex:1;display:flex;flex-direction:column;justify-content:center}
-.preview-frames img{max-height:calc(100% - 28px);width:100%;object-fit:contain;min-height:0}.preview-frames figcaption{font-size:16px}
-.passive-preview p{margin:5px}.cli-caption{font-family:monospace;font-size:14px;opacity:.8}
-
-.day-warning { position: fixed; top: 12px; left: 5%; right: 5%; z-index: 10; padding: 12px 20px; border: 3px solid #35223c; border-radius: 12px; background: #ffcd85; color: #35223c; font-size: 18px; text-align: center; pointer-events: none; }
-
-.workout-control { display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; align-items: center; }
-.workout-control label { display: flex; gap: 10px; align-items: center; }
-.workout-control .weight { width: 110px; font-size: 28px; }
-.workout-control button { padding: 10px 22px; border: 3px solid var(--ink); border-radius: 12px; background: var(--ivory); color: var(--ink); font: inherit; font-weight: 800; cursor: pointer; box-shadow: 3px 3px 0 var(--ink); }
-.workout-control button:disabled { opacity: .6; cursor: wait; }
-.workout-control button:focus-visible, .workout-control input:focus-visible { outline: 3px solid var(--go); outline-offset: 3px; }
-.workout-control > .small { flex-basis: 100%; }
-
-.remaining-sets { display: flex; flex-direction: column; align-items: center; gap: .5vh; }

@@ -35,7 +35,7 @@
         "label": "prompt",
         "title": "RFP — Time to move",
         "width": 500,
-        "height": 400,
+        "height": 360,
         "url": "index.html?window=prompt",
         "visible": false,
         "focus": false,

@@ -565,7 +565,7 @@ pub fn run() {
                         let mut daily = daily_state.lock().unwrap();
                         let snoozed = daily.snooze_until > now;
                         // Sleep/suspend is not coding time: a jump over 5s is deferred.
-                        let defer = engine::activity::excluded_elapsed(elapsed, false, snoozed);
+                        let defer = engine::activity::excluded_elapsed(elapsed, true, snoozed);
                         let snooze_expired = daily.snooze_until > 0. && daily.snooze_until <= now;
                         if snooze_expired { daily.snooze_until = 0.; }
                         (defer, snooze_expired, snoozed)

@@ -30,7 +30,7 @@ fn remember(app: &AppHandle, key: &str, value: &str) {
 /// the gym window so wherever the user drags it is remembered.
 pub(crate) fn place(app: &AppHandle) {
     if !std::env::args().any(|a| a == "--background") {
-        if let Some(main) = app.get_webview_window("main") { let _ = main.center(); let _ = main.show(); }
+        if let Some(main) = app.get_webview_window("main") { center_on_primary(&main); let _ = main.show(); }
     }
     let Some(gym) = app.get_webview_window("gym") else { return };
     let handle = app.clone();
@@ -44,6 +44,19 @@ pub(crate) fn place(app: &AppHandle) {
             }
         }
     });
+}
+
+/// Center a window on the primary monitor (`center()` can span the whole
+/// virtual desktop on multi-monitor X), shrinking it to fit.
+fn center_on_primary(w: &tauri::WebviewWindow) {
+    let _ = w.show(); // X ignores geometry set before the first map
+    let Some(m) = w.primary_monitor().ok().flatten().or_else(|| w.available_monitors().ok().and_then(|v| v.into_iter().next())) else { return };
+    let (pos, area, scale) = (m.position(), m.size(), m.scale_factor());
+    let width = ((960. * scale) as u32).min(area.width * 9 / 10);
+    let height = ((680. * scale) as u32).min(area.height * 9 / 10);
+    let _ = w.set_size(tauri::PhysicalSize { width, height });
+    let _ = w.set_position(Position::Physical(PhysicalPosition {
+        x: pos.x + (area.width - width) as i32 / 2, y: pos.y + (area.height - height) as i32 / 2 }));
 }
 
 /// Show the gym window on its monitor (remembered name, `$REPS_GYM_MONITOR`,
@@ -98,18 +111,18 @@ pub(crate) fn show_prompt(app: &AppHandle) {
         .filter(|g| g.is_visible().unwrap_or(false))
         .and_then(|g| g.current_monitor().ok().flatten())
         .and_then(|m| m.name().cloned());
-    let monitors = prompt.available_monitors().unwrap_or_default();
-    let target = monitors.iter().find(|m| m.name().cloned() != gym_monitor)
-        .or(monitors.first());
-    if let (Some(m), Ok(size)) = (target, prompt.outer_size()) {
-        let (pos, area) = (m.position(), m.size());
-        let x = pos.x + (area.width as i32 - size.width as i32).max(0) / 2;
-        let y = pos.y + (area.height as i32 - size.height as i32).max(0) / 2;
-        let _ = prompt.set_position(Position::Physical(PhysicalPosition { x, y }));
-    }
     let _ = prompt.set_always_on_top(true);
     let _ = prompt.set_visible_on_all_workspaces(true);
-    let _ = prompt.show();
+    let _ = prompt.show(); // X ignores geometry set before the first map
+    let monitors = prompt.available_monitors().unwrap_or_default();
+    let target = monitors.iter().find(|m| m.name().cloned() != gym_monitor).or(monitors.first());
+    if let Some(m) = target {
+        let (pos, area, scale) = (m.position(), m.size(), m.scale_factor());
+        let (w, h) = ((500. * scale) as i32, (360. * scale) as i32);
+        let x = pos.x + (area.width as i32 - w).max(0) / 2;
+        let y = pos.y + (area.height as i32 - h).max(0) / 2;
+        let _ = prompt.set_position(Position::Physical(PhysicalPosition { x, y }));
+    }
     let _ = prompt.request_user_attention(Some(tauri::UserAttentionType::Informational));
 }
 
@@ -118,7 +131,7 @@ pub(crate) fn hide_prompt(app: &AppHandle) {
 }
 
 pub(crate) fn show_main(app: &AppHandle) {
-    if let Some(main) = app.get_webview_window("main") { let _ = main.show(); let _ = main.unminimize(); let _ = main.set_focus(); }
+    if let Some(main) = app.get_webview_window("main") { if !main.is_visible().unwrap_or(true) { center_on_primary(&main); } let _ = main.show(); let _ = main.unminimize(); let _ = main.set_focus(); }
 }
 
 #[cfg(test)]
