@@ -33,11 +33,12 @@ fn phone_stream_url(value: &str) -> bool {
 impl Default for CameraSettings {
     fn default() -> Self { Self { consensus: false, usb_device: "/dev/video0".into(), usb_rotation: default_usb_rotation(), phone_url: String::new(), phone_rotation: 0 } }
 }
-pub fn get_camera_settings(app: AppHandle) -> Result<CameraSettings, String> {
-    let path = app.state::<crate::Runtime>().normal_home.join("cameras.json");
-    match std::fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| e.to_string()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(CameraSettings::default()),
+/// The saved camera choice; `None` when there is no `cameras.json`, which
+/// leaves the env camera index in charge.
+pub fn load_camera_settings(normal_home: &std::path::Path) -> Result<Option<CameraSettings>, String> {
+    match std::fs::read(normal_home.join("cameras.json")) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|e| e.to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.to_string()),
     }
 }
@@ -657,8 +658,8 @@ pub fn enable_metric_async(app: &AppHandle, exercise: String, target_reps: u32, 
             return;
         };
 
-        match get_camera_settings(app.clone()) {
-            Ok(settings) if settings.consensus && config.get("movementId").is_some() => {
+        match load_camera_settings(&app.state::<crate::Runtime>().normal_home) {
+            Ok(Some(settings)) if settings.consensus && config.get("movementId").is_some() => {
                 // Require an active version: legacy exercise fallback has no cycle evidence.
                 if let Some(object) = config.as_object_mut() { object.remove("exercise"); }
                 let phone_source = match std::env::var("REPS_PHONE_URL_FILE") {
@@ -679,13 +680,12 @@ pub fn enable_metric_async(app: &AppHandle, exercise: String, target_reps: u32, 
                         {"cameraId": "phone", "label": "Android phone", "kind": "rtsp", "transport": "direct", "source": phone_source, "rotate": settings.phone_rotation}
                     ] });
             }
-            Ok(settings) => {
-                if app.state::<crate::Runtime>().normal_home.join("cameras.json").exists() {
-                    config["camera"]["source"] = serde_json::json!("uri");
-                    config["camera"]["value"] = serde_json::json!(settings.usb_device);
-                    config["camera"]["rotate"] = serde_json::json!(settings.usb_rotation);
-                }
-            },
+            Ok(Some(settings)) => {
+                config["camera"]["source"] = serde_json::json!("uri");
+                config["camera"]["value"] = serde_json::json!(settings.usb_device);
+                config["camera"]["rotate"] = serde_json::json!(settings.usb_rotation);
+            }
+            Ok(None) => {}
             Err(error) => {
                 let _ = app.emit("vision-fallback", serde_json::json!({"reason": error}));
                 return;
