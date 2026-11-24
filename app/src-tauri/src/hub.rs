@@ -6,6 +6,7 @@
 
 use std::sync::Mutex;
 
+use engine::session::{Fact, Release};
 use engine::types::Progress;
 use hub_client::{EnableMetric, HubSupervisor, HubSupervisorConfig, VisionEvent, VisionHub};
 use tauri::{AppHandle, Emitter, Manager};
@@ -138,7 +139,7 @@ fn publication_storage_error(app: &AppHandle, error: &str) {
 }
 
 /// Persist an app event locally, then publish asynchronously to the hub.
-pub fn queue_event(event_type: &str, payload: serde_json::Value) {
+fn queue_event(event_type: &str, payload: serde_json::Value) {
     let mut params = serde_json::json!({"appId": APP_ID, "type": event_type, "id": format!("evt-{}", new_message_id()), "payload": payload});
     if let Some(sid) = session_id() {
         params["sessionId"] = serde_json::json!(sid);
@@ -233,75 +234,55 @@ fn start_publisher(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// The durable events implied by a phase change — pure so the mapping is
-/// unit-testable. `lock_cycle` distinguishes the command-worthy transitions:
-/// entering ExerciseRequired starts a session, returning to Coding ends it.
-pub(crate) fn events_for_transition(
-    prev: Option<&engine::types::Phase>,
-    next: &engine::types::Phase,
-    prescription: Option<&engine::types::Prescription>,
-) -> Vec<(&'static str, serde_json::Value)> {
-    use engine::types::Phase;
-    match (prev, next) {
-        (None, Phase::Coding) | (Some(Phase::Unlocked), Phase::Coding) => {
-            vec![("coding_period_started", serde_json::json!({}))]
-        }
-        (Some(Phase::Coding), Phase::ExerciseRequired) => {
-            let mut events = vec![("coding_period_expired", serde_json::json!({}))];
-            if let Some(rx) = prescription {
-                events.push((
-                    "workout_prescribed",
-                    serde_json::json!({
-                        "exercise": rx.exercise,
-                        "targetReps": rx.target_reps,
-                        "targetSeconds": rx.target_seconds,
-                    }),
-                ));
-            }
-            events.push(("desktop_locked", serde_json::json!({})));
-            events
-        }
-        (Some(Phase::WorkoutActive), Phase::Unlocked)
-        | (Some(Phase::WeightConfirmation), Phase::Unlocked) => vec![
-            ("workout_completed", serde_json::json!({})),
-            ("desktop_unlocked", serde_json::json!({})),
+/// The durable events for one engine fact — pure so the mapping is
+/// unit-testable. `Started` maps to nothing: detector_started/stopped publish
+/// at the enable/disable sites.
+pub(crate) fn wire_events(fact: &Fact) -> Vec<(&'static str, serde_json::Value)> {
+    use serde_json::json;
+    match fact {
+        Fact::CodingStarted => vec![("coding_period_started", json!({}))],
+        Fact::Locked(rx) => vec![
+            ("coding_period_expired", json!({})),
+            ("workout_prescribed", json!({
+                "exercise": rx.exercise,
+                "targetReps": rx.target_reps,
+                "targetSeconds": rx.target_seconds,
+            })),
+            ("desktop_locked", json!({})),
         ],
-        _ => vec![],
+        Fact::Started => vec![],
+        // Honor mode is visible in durable history, never a silent degradation.
+        Fact::HonorUsed => vec![("override_used", json!({"mode": "honor"}))],
+        Fact::WeightLogged { exercise, weight } => {
+            vec![("weight_logged", json!({"exercise": exercise, "weight": weight}))]
+        }
+        Fact::Completed => vec![("workout_completed", json!({})), ("desktop_unlocked", json!({}))],
+        Fact::Released(why) => {
+            let reason = match why { Release::Cancel => "cancel", Release::Snooze => "snooze", Release::Skip => "skip" };
+            vec![("desktop_unlocked", json!({"reason": reason}))]
+        }
     }
 }
 
-/// Publish the durable events implied by a phase change. Called from
-/// emit_snapshot — the single choke point every state mutation goes through.
-pub(crate) fn publish_phase_transition(snap: &engine::types::Snapshot) {
-    use engine::types::Phase;
-    static LAST: Mutex<Option<Phase>> = Mutex::new(None);
-    let prev = {
-        let mut last = LAST.lock().unwrap();
-        let prev = last.clone();
-        *last = Some(snap.phase.clone());
-        prev
-    };
-    if prev.as_ref() == Some(&snap.phase) {
-        return;
-    }
-    // Session + lock-cycle bookkeeping around the pure mapping: a new lock
-    // cycle mints the session id and records the lock as command → result;
-    // returning to coding closes the session.
-    if matches!((prev.as_ref(), &snap.phase), (Some(Phase::Coding), Phase::ExerciseRequired)) {
-        new_session_id();
-    }
-    let events = events_for_transition(prev.as_ref(), &snap.phase, snap.prescription.as_ref());
-    for (event_type, payload) in events {
-        if event_type == "desktop_locked" {
-            // The lock is a requested operation with a distinct outcome, not
-            // just an event: command → action result → the desktop_locked fact.
-            let command_id = queue_command("desktop.lock_requested", serde_json::json!({}));
-            queue_action_result("desktop.lock_succeeded", &command_id, "succeeded");
+/// Publish the durable events for the facts a session transition returned.
+/// Every transition call site passes its facts here, in order. This is the one
+/// place the "debug mode publishes nothing" rule is applied to the lifecycle.
+pub(crate) fn publish_facts(facts: &[Fact]) {
+    if !PUBLICATIONS_ENABLED.load(std::sync::atomic::Ordering::SeqCst) { return; }
+    for fact in facts {
+        // Each lock cycle is one session: minted at the lock, closed once the
+        // return to coding is recorded.
+        if matches!(fact, Fact::Locked(_)) { new_session_id(); }
+        for (event_type, payload) in wire_events(fact) {
+            if event_type == "desktop_locked" {
+                // The lock is a requested operation with a distinct outcome, not
+                // just an event: command → action result → the desktop_locked fact.
+                let command_id = queue_command("desktop.lock_requested", serde_json::json!({}));
+                queue_action_result("desktop.lock_succeeded", &command_id, "succeeded");
+            }
+            queue_event(event_type, payload);
         }
-        queue_event(event_type, payload);
-    }
-    if matches!((prev.as_ref(), &snap.phase), (Some(Phase::Unlocked), Phase::Coding)) {
-        *SESSION_ID.lock().unwrap() = None;
+        if matches!(fact, Fact::CodingStarted) { *SESSION_ID.lock().unwrap() = None; }
     }
 }
 
@@ -600,7 +581,7 @@ fn pump_events(app: AppHandle, rx: std::sync::mpsc::Receiver<VisionEvent>) {
                 }
                 let core_state = app.state::<crate::SharedCore>();
                 let mut core = core_state.lock().unwrap();
-                core.session.report_progress(Progress { value, unit, satisfied });
+                publish_facts(&core.session.report_progress(Progress { value, unit, satisfied }));
                 let snap = crate::persist_and_snapshot(&mut core);
                 drop(core);
                 crate::emit_snapshot(&app, &snap);
@@ -792,11 +773,11 @@ pub(crate) fn disable_metric_now(app: &AppHandle) {
 pub fn honor_complete(app: &AppHandle) -> Result<engine::types::Snapshot, String> {
     let core_state = app.state::<crate::SharedCore>();
     let mut core = core_state.lock().unwrap();
-    if !core.session.honor_complete() {
+    let facts = core.session.honor_complete();
+    if facts.is_empty() {
         return Err("No active workout to complete".into());
     }
-    // Honor mode is visible in durable history, never a silent degradation.
-    queue_event("override_used", serde_json::json!({"mode": "honor"}));
+    publish_facts(&facts);
     let snap = crate::persist_and_snapshot(&mut core);
     drop(core);
     crate::emit_snapshot(app, &snap);
@@ -963,8 +944,8 @@ mod tests {
     }
 
     #[test]
-    fn phase_transitions_map_to_the_v1_event_contract() {
-        use engine::types::{ExerciseKind, Phase, Prescription};
+    fn facts_map_to_the_v1_event_contract() {
+        use engine::types::{ExerciseKind, Prescription};
         let rx = Prescription {
             exercise: "squat".into(),
             kind: ExerciseKind::Rep,
@@ -972,40 +953,40 @@ mod tests {
             target_seconds: 0.0,
             default_weight: 95.0,
         };
-        let types = |prev: Option<&Phase>, next: &Phase| -> Vec<&'static str> {
-            events_for_transition(prev, next, Some(&rx))
-                .into_iter()
-                .map(|(t, _)| t)
-                .collect()
+        let types = |facts: &[Fact]| -> Vec<&'static str> {
+            facts.iter().flat_map(wire_events).map(|(t, _)| t).collect()
         };
-        // the game loop, in order
-        assert_eq!(types(None, &Phase::Coding), vec!["coding_period_started"]);
-        assert_eq!(
-            types(Some(&Phase::Coding), &Phase::ExerciseRequired),
-            vec!["coding_period_expired", "workout_prescribed", "desktop_locked"],
-        );
-        // detector_started/stopped publish at the enable/disable sites, not here
-        assert!(types(Some(&Phase::ExerciseRequired), &Phase::WorkoutActive).is_empty());
-        assert!(types(Some(&Phase::WorkoutActive), &Phase::WeightConfirmation).is_empty());
-        assert_eq!(
-            types(Some(&Phase::WeightConfirmation), &Phase::Unlocked),
-            vec!["workout_completed", "desktop_unlocked"],
-        );
-        // continuous activities (jumprope/stretch) skip weight confirmation
-        assert_eq!(
-            types(Some(&Phase::WorkoutActive), &Phase::Unlocked),
-            vec!["workout_completed", "desktop_unlocked"],
-        );
-        assert_eq!(types(Some(&Phase::Unlocked), &Phase::Coding), vec!["coding_period_started"]);
-        // prescription payload carries the exercise + targets
-        let prescribed = events_for_transition(
-            Some(&Phase::Coding),
-            &Phase::ExerciseRequired,
-            Some(&rx),
-        );
-        let (_, payload) = prescribed.iter().find(|(t, _)| *t == "workout_prescribed").unwrap();
-        assert_eq!(payload["exercise"], "squat");
-        assert_eq!(payload["targetReps"], 10);
+        // the game loop, in order (detector_started/stopped publish at the
+        // enable/disable sites, not here)
+        let cycle = [
+            Fact::CodingStarted,
+            Fact::Locked(rx.clone()),
+            Fact::Started,
+            Fact::WeightLogged { exercise: "squat".into(), weight: 95.0 },
+            Fact::Completed,
+            Fact::CodingStarted,
+        ];
+        assert_eq!(types(&cycle), vec![
+            "coding_period_started",
+            "coding_period_expired", "workout_prescribed", "desktop_locked",
+            "weight_logged",
+            "workout_completed", "desktop_unlocked",
+            "coding_period_started",
+        ]);
+        // prescription and weight payloads
+        let locked = wire_events(&cycle[1]);
+        assert_eq!(locked[1].1, serde_json::json!({"exercise": "squat", "targetReps": 10, "targetSeconds": 0.0}));
+        assert_eq!(wire_events(&cycle[3])[0].1, serde_json::json!({"exercise": "squat", "weight": 95.0}));
+        // a completion unlock carries no reason; a release says why
+        assert_eq!(wire_events(&Fact::Completed)[1], ("desktop_unlocked", serde_json::json!({})));
+        for (why, reason) in [(Release::Cancel, "cancel"), (Release::Snooze, "snooze"), (Release::Skip, "skip")] {
+            assert_eq!(wire_events(&Fact::Released(why)), vec![("desktop_unlocked", serde_json::json!({"reason": reason}))]);
+        }
+        assert_eq!(wire_events(&Fact::HonorUsed), vec![("override_used", serde_json::json!({"mode": "honor"}))]);
+        // every mapped type is declared in the manifest
+        let manifest = reps_manifest();
+        let all = [cycle.to_vec(), vec![Fact::HonorUsed, Fact::Released(Release::Cancel)]].concat();
+        for t in types(&all) { assert!(manifest["events"].get(t).is_some(), "undeclared event {t}"); }
     }
 }
 

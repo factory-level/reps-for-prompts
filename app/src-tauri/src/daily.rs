@@ -1,5 +1,5 @@
 use std::sync::{Mutex, atomic::Ordering};
-use engine::{activity::{AgentPresence, detect}, clock::{Clock, SystemClock}, types::Phase};
+use engine::{activity::{AgentPresence, detect}, clock::{Clock, SystemClock}, session::Release, types::Phase};
 use serde::Serialize;
 use tauri::{AppHandle, Manager};
 use crate::{SharedCore, Runtime};
@@ -26,9 +26,12 @@ pub fn reminder_action(app: AppHandle, action: String, minutes: Option<u32>) -> 
     let state = app.state::<SharedCore>(); let mut core = state.lock().unwrap();
     let phase = core.session.snapshot(now).phase;
     if action == "start" {
-        if phase == Phase::Coding { core.session.debug_force_workout(now, &SystemClock.today()); }
-        else if phase == Phase::ExerciseRequired { core.session.begin_workout(); }
-        else { return Err("A workout is already in progress".into()); }
+        let facts = core.session.start_workout(&SystemClock.today());
+        if facts.is_empty() {
+            return Err(if phase == Phase::Coding { "Today's routine is complete; nothing to start" } else { "A workout is already in progress" }.into());
+        }
+        // Before the detector is enabled: the enable path reads the session id.
+        crate::hub::publish_facts(&facts);
         core.store.set_setting("snooze_until", "0").map_err(|e| e.to_string())?;
         app.state::<SharedDaily>().lock().unwrap().snooze_until = 0.;
         let snap = crate::persist_and_snapshot(&mut core); drop(core);
@@ -41,7 +44,7 @@ pub fn reminder_action(app: AppHandle, action: String, minutes: Option<u32>) -> 
         } else { 0. };
         core.store.set_setting("snooze_until", &until.to_string()).map_err(|e| e.to_string())?;
         app.state::<SharedDaily>().lock().unwrap().snooze_until = until;
-        core.session.debug_force_coding(now);
+        crate::hub::publish_facts(&core.session.release(if action == "snooze" { Release::Snooze } else { Release::Skip }, now));
         // Snooze means remind at expiry, rather than expiry plus a full interval.
         if until > 0. { core.session.configure_timer(0., now); }
         else { let interval = core.store.setting("work_minutes", "25").parse().unwrap_or(25.); core.session.configure_timer(interval, now); }
