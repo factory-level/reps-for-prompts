@@ -45,6 +45,7 @@ pub struct ProgressContext {
     pub metric_id: Option<String>,
     pub session_id: Option<String>,
     pub consensus: Option<serde_json::Value>,
+    pub camera_status: Option<String>,
 }
 
 impl ProgressContext {
@@ -175,6 +176,7 @@ pub(crate) fn event_from_frame(frame: &serde_json::Value) -> Option<VisionEvent>
                     consensus: data.get("consensus").cloned(),
                     metric_id: frame.get("metricId").and_then(|v| v.as_str()).map(str::to_string),
                     session_id: data.get("sessionId").and_then(|v| v.as_str()).map(str::to_string),
+                    camera_status: data.get("cameraStatus").and_then(|v| v.as_str()).map(str::to_string),
                 },
             })
         }
@@ -199,9 +201,11 @@ mod progress_tests {
     #[test]
     fn preserves_identity_and_rejects_other_workouts() {
         let frame = json!({"stream":"progress", "metricId":"workout", "data":{
-            "sessionId":"current", "value":2, "unit":"reps", "satisfied":false
+            "sessionId":"current", "value":2, "unit":"reps", "satisfied":false,
+            "cameraStatus":"disconnected"
         }});
         let Some(VisionEvent::Progress { context, .. }) = event_from_frame(&frame) else { panic!() };
+        assert_eq!(context.camera_status.as_deref(), Some("disconnected"));
         assert!(context.belongs_to("workout", Some("current")));
         assert!(!context.belongs_to("workout", Some("previous")));
         assert!(!context.belongs_to("preview", Some("current")));

@@ -272,7 +272,7 @@ fn toggle_gym_fullscreen(app: AppHandle) {
 
 /// Honor-mode completion: camera path failed, the user attests the set.
 #[tauri::command]
-fn honor_complete(app: AppHandle) -> Snapshot {
+fn honor_complete(app: AppHandle) -> Result<Snapshot, String> {
     hub::honor_complete(&app)
 }
 

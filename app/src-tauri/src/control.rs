@@ -105,7 +105,7 @@ fn dispatch(app:&AppHandle, command:Command)->Result<serde_json::Value,String>{
    if !matches!(phase,Phase::WorkoutActive|Phase::WeightConfirmation){return Err("No active workout to finish. Run: reps start".into());}
    if phase==Phase::WorkoutActive {
     if !honor{return Err("Target not yet detected. Use --honor only if you completed the prescribed set yourself".into());}
-    crate::hub::honor_complete(app);
+    crate::hub::honor_complete(app)?;
    }
    let phase=app.state::<SharedCore>().lock().unwrap().session.snapshot(SystemClock.now()).phase;
    if phase==Phase::WeightConfirmation {crate::confirm_weight(app.clone(),app.state::<SharedCore>(),weight);}

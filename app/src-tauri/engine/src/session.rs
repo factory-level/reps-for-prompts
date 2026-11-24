@@ -44,10 +44,21 @@ impl Session {
         self.plan.as_ref()
     }
 
-    /// Honor-mode: the set completing now was not camera-verified. Resets
-    /// once the set's record is built.
-    pub fn mark_unverified(&mut self) {
+    /// Honor-mode: the user attests the active set, so it completes at the
+    /// prescription target but is not camera-verified. Resets once the set's
+    /// record is built or the set is cancelled.
+    pub fn honor_complete(&mut self) -> bool {
+        if self.phase != Phase::WorkoutActive {
+            return false;
+        }
         self.verified = false;
+        let (value, unit) = match &self.prescription {
+            Some(rx) if rx.target_seconds > 0.0 => (rx.target_seconds, "seconds"),
+            Some(rx) => (rx.target_reps as f64, "reps"),
+            None => (0.0, "reps"),
+        };
+        self.report_progress(Progress { value, unit: unit.into(), satisfied: true });
+        true
     }
 
     pub fn start(&mut self, now: f64, _today: &str) {
@@ -202,6 +213,7 @@ impl Session {
     pub fn debug_force_coding(&mut self, now: f64) {
         self.prescription = None;
         self.progress = None;
+        self.verified = true;
         self.phase = Phase::Coding;
         self.timer.start(now);
     }
@@ -390,8 +402,7 @@ mod tests {
         s.start(0.0, "2026-07-19");
         s.tick(360.0, "2026-07-19");
         s.begin_workout();
-        s.mark_unverified(); // camera failed: user pressed Done
-        s.report_progress(done("reps", 10.0));
+        assert!(s.honor_complete()); // camera failed: user pressed Done
         let rec = s.confirm_weight(45.0, "2026-07-19").unwrap();
         assert!(!rec.verified);
     }
@@ -402,8 +413,7 @@ mod tests {
         s.start(0.0, "2026-07-19");
         s.tick(360.0, "2026-07-19");
         s.begin_workout();
-        s.mark_unverified();
-        s.report_progress(done("reps", 10.0));
+        assert!(s.honor_complete());
         s.confirm_weight(45.0, "2026-07-19").unwrap();
         s.take_pending_record();
         s.resume_coding(361.0);
@@ -412,6 +422,25 @@ mod tests {
         s.begin_workout();
         s.report_progress(done("reps", 10.0));
         let rec = s.confirm_weight(50.0, "2026-07-19").unwrap();
+        assert!(rec.verified);
+    }
+
+    #[test]
+    fn honor_outside_active_workout_is_rejected_and_cancel_restores_verification() {
+        let mut s = session();
+        s.start(0.0, "2026-07-19");
+        assert!(!s.honor_complete());
+        assert!(s.verified);
+        assert_eq!(s.snapshot(0.0).phase, Phase::Coding);
+        assert!(s.snapshot(0.0).progress.is_none());
+
+        s.debug_force_workout(1.0, "2026-07-19");
+        assert!(s.honor_complete());
+        s.debug_force_coding(2.0); // cancelled: the honor must not leak into the next set
+        s.tick(362.0, "2026-07-19");
+        s.begin_workout();
+        s.report_progress(done("reps", 10.0));
+        let rec = s.confirm_weight(45.0, "2026-07-19").unwrap();
         assert!(rec.verified);
     }
 }

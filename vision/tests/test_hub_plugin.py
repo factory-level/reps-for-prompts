@@ -228,6 +228,26 @@ def test_stream_jumprope_reports_duration():
     assert any(p["satisfied"] for p in progress)
 
 
+def test_disconnected_progress_keeps_the_stream_unit():
+    class LiveFakeCapture(FakeCapture):
+        reconnected = False
+        timing_invalidated = False
+
+    poses = [{"left_hip": (0.5, 0.5, 0.9), "right_hip": (0.5, 0.5, 0.9)}] * 3
+    plugin = make_plugin(FakeEstimator(poses), LiveFakeCapture(len(poses)))
+    plugin.configure({"activity": "jumprope", "targetSeconds": 30.0, "resetAfter": 2.0})
+
+    emitted = []
+    plugin.start_stream({"camera": {"source": "index", "value": 0}}, lambda s, d: emitted.append((s, d)))
+    deadline = time.time() + 2.0
+    while time.time() < deadline and not any(d.get("cameraStatus") for _, d in list(emitted)):
+        time.sleep(0.01)
+    plugin.stop_stream()
+
+    disconnected = [d for s, d in emitted if s == "progress" and d.get("cameraStatus") == "disconnected"]
+    assert disconnected and disconnected[0]["unit"] == "seconds"
+
+
 def test_stream_requires_configure_first():
     plugin = make_plugin(FakeEstimator([]), FakeCapture(0))
     try:
