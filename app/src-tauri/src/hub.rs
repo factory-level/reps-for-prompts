@@ -6,7 +6,6 @@
 
 use std::sync::Mutex;
 
-use engine::clock::{Clock, SystemClock};
 use engine::types::Progress;
 use hub_client::{EnableMetric, HubSupervisor, HubSupervisorConfig, VisionEvent, VisionHub};
 use tauri::{AppHandle, Emitter, Manager};
@@ -137,7 +136,7 @@ fn queue(mut message: Publish) {
 
 fn publication_storage_error(app: &AppHandle, error: &str) {
     eprintln!("[EVENTS] durable publication failed: {error}");
-    let _ = app.emit("vision-fallback", serde_json::json!({"reason": "local event storage unavailable", "details": error}));
+    crate::control::error(app, format!("local event storage unavailable: {error}"));
 }
 
 /// Persist an app event locally, then publish asynchronously to the hub.
@@ -525,11 +524,10 @@ pub fn start(app: AppHandle) {
             let supervisor = HubSupervisor::start_retrying(
                 config,
                 { let app = app.clone(); move || app.state::<crate::Runtime>().is_stopping() },
-                { let app = app.clone(); move |error, delay| {
+                move |error, delay| {
                     set_hub_error(Some(error.to_string()));
                     eprintln!("hub: failed to start ({error}); honor mode, retrying in {}s", delay.as_secs_f32());
-                    let _ = app.emit("vision-fallback", serde_json::json!({"reason": error.to_string()}));
-                } },
+                },
             );
             let state = app.state::<SharedHub>();
             let mut slot = state.lock().unwrap();
@@ -796,24 +794,19 @@ pub(crate) fn disable_metric_now(app: &AppHandle) {
 }
 
 /// Honor-mode completion: the camera path failed, the user pressed Done.
-pub fn honor_complete(app: &AppHandle) -> engine::types::Snapshot {
-    let clock = SystemClock;
-    // Honor mode is visible in durable history, never a silent degradation.
-    queue_event("override_used", serde_json::json!({"mode": "honor"}));
+pub fn honor_complete(app: &AppHandle) -> Result<engine::types::Snapshot, String> {
     let core_state = app.state::<crate::SharedCore>();
     let mut core = core_state.lock().unwrap();
-    core.session.mark_unverified();
-    let (value, unit) = match core.session.snapshot(clock.now()).prescription {
-        Some(rx) if rx.target_seconds > 0.0 => (rx.target_seconds, "seconds".to_string()),
-        Some(rx) => (rx.target_reps as f64, "reps".to_string()),
-        None => (0.0, "reps".to_string()),
-    };
-    core.session.report_progress(Progress { value, unit, satisfied: true });
+    if !core.session.honor_complete() {
+        return Err("No active workout to complete".into());
+    }
+    // Honor mode is visible in durable history, never a silent degradation.
+    queue_event("override_used", serde_json::json!({"mode": "honor"}));
     let snap = crate::persist_and_snapshot(&mut core);
     drop(core);
     crate::emit_snapshot(app, &snap);
     disable_metric_async(app);
-    snap
+    Ok(snap)
 }
 
 #[cfg(test)]

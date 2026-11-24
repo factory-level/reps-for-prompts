@@ -52,6 +52,7 @@ class StreamLoop:
 
     def _run(self) -> None:
         last_value = 0.0
+        last_unit = "reps"
         was_satisfied = False
         source_ended = False
         frame_index = 0
@@ -60,7 +61,7 @@ class StreamLoop:
                 ok, frame = self._capture.read()
                 if not ok:
                     if hasattr(self._capture, "reconnected"):
-                        self._emit("progress", {**self._provenance, "value": last_value, "unit": "reps", "satisfied": False,
+                        self._emit("progress", {**self._provenance, "value": last_value, "unit": last_unit, "satisfied": False,
                             "cameraStatus": "disconnected"})
                         continue
                     source_ended = True
@@ -150,6 +151,7 @@ class StreamLoop:
                     },
                 )
                 last_value = progress.value
+                last_unit = progress.unit
                 if progress.satisfied and not was_satisfied:
                     self._emit("event", {"type": "target_reached", "value": progress.value, **self._provenance})
                 was_satisfied = progress.satisfied
