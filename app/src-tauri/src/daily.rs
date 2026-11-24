@@ -1,5 +1,5 @@
 use std::sync::{Mutex, atomic::Ordering};
-use engine::{activity::{AgentPresence, detect}, clock::{Clock, SystemClock}, session::Release, types::Phase};
+use engine::{activity::{AgentPresence, detect}, clock::{Clock, SystemClock}, types::Phase};
 use serde::Serialize;
 use tauri::{AppHandle, Manager};
 use crate::{Lifecycle, Runtime};
@@ -21,36 +21,17 @@ pub fn daily_status(app: AppHandle) -> Status {
 }
 
 pub fn reminder_action(app: AppHandle, action: String, minutes: Option<u32>) -> Result<(), String> {
-    if app.state::<Runtime>().is_debug() { return Err("Switch to Workout mode first".into()); }
-    let now = SystemClock.now();
-    let life = app.state::<Lifecycle>(); let mut core = life.core();
-    let phase = core.session.snapshot(now).phase;
-    if action == "start" {
-        let facts = core.session.start_workout(&SystemClock.today());
-        if facts.is_empty() {
-            return Err(if phase == Phase::Coding { "Today's routine is complete; nothing to start" } else { "A workout is already in progress" }.into());
-        }
-        // Before the detector is enabled: the enable path reads the session id.
-        life.publish_facts(&facts);
-        core.store.set_setting("snooze_until", "0").map_err(|e| e.to_string())?;
-        app.state::<SharedDaily>().lock().unwrap().snooze_until = 0.;
-        let snap = life.persist(&mut core); drop(core);
-        crate::enable_metric_for(&life, &snap); life.emit(&snap);
-    } else if action == "snooze" || action == "skip" {
-        if !matches!(phase, Phase::Coding | Phase::ExerciseRequired) { return Err("Finish or stop the current workout first".into()); }
-        let until = if action == "snooze" {
-            let m = minutes.unwrap_or(15); if ![5,15,30].contains(&m) { return Err("Choose 5, 15, or 30 minutes".into()); }
-            now + m as f64 * 60.
-        } else { 0. };
-        core.store.set_setting("snooze_until", &until.to_string()).map_err(|e| e.to_string())?;
-        app.state::<SharedDaily>().lock().unwrap().snooze_until = until;
-        life.publish_facts(&core.session.release(if action == "snooze" { Release::Snooze } else { Release::Skip }, now));
-        // Snooze means remind at expiry, rather than expiry plus a full interval.
-        if until > 0. { core.session.configure_timer(0., now); }
-        else { let interval = core.store.setting("work_minutes", "25").parse().unwrap_or(25.); core.session.configure_timer(interval, now); }
-        let snap = life.persist(&mut core); drop(core);
-        life.disable(); crate::windows::release(&app); life.emit(&snap);
-    } else { return Err("Unknown reminder action".into()); }
+    let life = app.state::<Lifecycle>();
+    match action.as_str() {
+        "start" => life.start()?,
+        "snooze" => life.snooze(minutes.unwrap_or(15))?,
+        "skip" => life.skip()?,
+        _ => return Err("Unknown reminder action".into()),
+    };
+    // The tick loop reads the snooze from Daily; the lifecycle stored it.
+    let snooze_until = life.core().store.setting("snooze_until", "0").parse().unwrap_or(0.);
+    app.state::<SharedDaily>().lock().unwrap().snooze_until = snooze_until;
+    if action != "start" { crate::windows::release(&app); }
     Ok(())
 }
 

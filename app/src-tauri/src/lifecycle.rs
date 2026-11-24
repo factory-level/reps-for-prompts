@@ -166,6 +166,51 @@ impl Lifecycle {
 
     // ---- Entry points ------------------------------------------------------
 
+    /// Start the set that is owed: the one the lock prescribed, or — early,
+    /// while coding — the next one of the day.
+    pub fn start(&self) -> Result<Snapshot, String> {
+        if self.debug { return Err("Switch to Workout mode first".into()); }
+        self.step(|core, now, today| {
+            let phase = core.session.snapshot(now).phase;
+            let facts = core.session.start_workout(today);
+            if facts.is_empty() {
+                return Err(if phase == Phase::Coding { "Today's routine is complete; nothing to start" } else { "A workout is already in progress" }.into());
+            }
+            // Starting a set ends a snooze. The set is under way either way.
+            if let Err(error) = core.store.set_setting("snooze_until", "0") { eprintln!("failed to clear snooze: {error}"); }
+            Ok(facts)
+        })
+    }
+
+    /// Put the reminder off for 5, 15 or 30 minutes.
+    pub fn snooze(&self, minutes: u32) -> Result<Snapshot, String> {
+        self.put_off(Release::Snooze, Some(minutes))
+    }
+
+    /// Skip this reminder; the next one comes after a full coding interval.
+    pub fn skip(&self) -> Result<Snapshot, String> {
+        self.put_off(Release::Skip, None)
+    }
+
+    fn put_off(&self, why: Release, snooze_minutes: Option<u32>) -> Result<Snapshot, String> {
+        if self.debug { return Err("Switch to Workout mode first".into()); }
+        self.step(|core, now, _| {
+            if !matches!(core.session.snapshot(now).phase, Phase::Coding | Phase::ExerciseRequired) {
+                return Err("Finish or stop the current workout first".into());
+            }
+            let until = match snooze_minutes {
+                Some(minutes) if [5, 15, 30].contains(&minutes) => now + minutes as f64 * 60.,
+                Some(_) => return Err("Choose 5, 15, or 30 minutes".into()),
+                None => 0.,
+            };
+            core.store.set_setting("snooze_until", &until.to_string()).map_err(|e| e.to_string())?;
+            let facts = core.session.release(why, now);
+            // Snooze means remind at expiry, rather than expiry plus a full interval.
+            core.session.configure_timer(if until > 0. { 0. } else { work_minutes(core) }, now);
+            Ok(facts)
+        })
+    }
+
     /// Complete the set: log the weight once the target was reached, or —
     /// `honor` — attest a set the camera could not verify. Honor completion
     /// always works during an active workout.
@@ -432,6 +477,7 @@ mod tests {
     struct Rig {
         life: Lifecycle,
         effects: Recording,
+        clock: SharedClock,
         /// The fake hub's call log; stays empty when the hub is absent.
         calls: Arc<Mutex<Vec<String>>>,
     }
@@ -458,6 +504,7 @@ mod tests {
             WorkoutEngine::new(default_rotation(), default_continuous_pool(), 20),
         );
         session.set_plan(engine::plan::DailyPlan::from_routine_json(routine, DAY).unwrap());
+        let _ = session.start(1000.0, DAY);
         let core = Core { session, store: Store::open(std::path::Path::new(":memory:")).unwrap() };
         let calls = hub.as_ref().map(|hub| hub.calls.clone()).unwrap_or_default();
         let hub: SharedHub = Arc::new(Mutex::new(hub.map(|hub| Box::new(hub) as Box<dyn hub_client::VisionHub>)));
@@ -472,11 +519,24 @@ mod tests {
             camera_rotate: None,
         }));
         let life = Lifecycle::new(core, Box::new(clock.clone()), hub, Box::new(effects.clone()), inputs, debug, true);
-        Rig { life, effects, calls }
+        Rig { life, effects, clock, calls }
     }
 
     fn start(rig: &Rig) -> Snapshot {
-        rig.life.step(|core, _, today| Ok(core.session.start_workout(today))).unwrap()
+        rig.life.start().unwrap()
+    }
+
+    /// Let the coding timer run out.
+    fn lock(rig: &Rig) -> Snapshot {
+        rig.clock.0.lock().unwrap().advance(1500.0);
+        rig.life.step(|core, now, today| Ok(core.session.tick(now, today))).unwrap()
+    }
+
+    fn payload(rig: &Rig, event_type: &str) -> Value {
+        rig.effects.0.lock().unwrap().published.iter().rev().find_map(|publication| match publication {
+            Publication::Event(p) if p["type"] == event_type => Some(p["payload"].clone()),
+            _ => None,
+        }).unwrap()
     }
 
     const LOCK: [&str; 5] = [
@@ -536,9 +596,7 @@ mod tests {
         assert_eq!(rig.types(), [&LOCK[..], &[
             "detector_started", "desktop_unlocked", "coding_period_started", "detector_stopped",
         ]].concat());
-        let published = rig.effects.0.lock().unwrap().published.clone();
-        let Publication::Event(unlocked) = &published[6] else { panic!() };
-        assert_eq!(unlocked["payload"], json!({"reason": "cancel"}));
+        assert_eq!(payload(&rig, "desktop_unlocked"), json!({"reason": "cancel"}));
         // The session closes with the return to coding.
         assert!(rig.life.gate.lock().unwrap().session_id.is_none());
         assert_eq!(rig.verified(), Vec::<bool>::new());
@@ -562,5 +620,71 @@ mod tests {
         assert_eq!(sessions.len(), 2);
         assert!(sessions[0].is_some() && sessions[1].is_some());
         assert_ne!(sessions[0], sessions[1]);
+    }
+
+    #[test]
+    fn start_locks_starts_and_enables_the_detector_for_the_prescription() {
+        let rig = rig(LIFTS, Some(FakeHub::new(vec![])), false);
+        let snapshot = start(&rig);
+        assert_eq!(snapshot.phase, Phase::WorkoutActive);
+        assert_eq!(payload(&rig, "workout_prescribed"), json!({"exercise": "squat", "targetReps": 5, "targetSeconds": 0.0}));
+        assert_eq!(payload(&rig, "detector_started"), json!({"exercise": "squat"}));
+        assert_eq!(rig.types(), [&LOCK[..], &["detector_started"]].concat());
+        // Stale-stream teardown, then the enable.
+        assert_eq!(rig.calls()[0], "disable:workout");
+        assert!(rig.calls().last().unwrap().starts_with("enable:workout:"));
+        assert_eq!(rig.life.vision_status(), VisionStatus::Available);
+        assert_eq!(rig.life.core().store.setting("snooze_until", ""), "0");
+
+        let published = rig.wire().len();
+        assert_eq!(rig.life.start().unwrap_err(), "A workout is already in progress");
+        assert_eq!(rig.wire().len(), published);
+    }
+
+    #[test]
+    fn start_is_rejected_when_the_day_is_done_or_in_debug_mode() {
+        let rig_done = rig(r#"{"lifts":[{"exercise":"squat","sets":1,"reps":5}]}"#, None, false);
+        start(&rig_done);
+        rig_done.life.finish(95.0, true).unwrap();
+        rig_done.life.cancel();
+        assert_eq!(rig_done.life.start().unwrap_err(), "Today's routine is complete; nothing to start");
+
+        let debug = rig(LIFTS, None, true);
+        assert_eq!(debug.life.start().unwrap_err(), "Switch to Workout mode first");
+        assert_eq!(debug.life.skip().unwrap_err(), "Switch to Workout mode first");
+    }
+
+    #[test]
+    fn snooze_unlocks_with_its_reason_and_reminds_at_expiry() {
+        let rig = rig(LIFTS, Some(FakeHub::new(vec![])), false);
+        assert_eq!(lock(&rig).phase, Phase::ExerciseRequired);
+        assert_eq!(rig.life.snooze(7).unwrap_err(), "Choose 5, 15, or 30 minutes");
+
+        let snapshot = rig.life.snooze(15).unwrap();
+        assert_eq!(snapshot.phase, Phase::Coding);
+        assert_eq!(snapshot.remaining_seconds, 0.0);
+        assert_eq!(rig.life.core().store.setting("snooze_until", ""), (2500.0 + 900.0).to_string());
+        assert_eq!(rig.types(), [&LOCK[..], &["desktop_unlocked", "coding_period_started"]].concat());
+        assert_eq!(payload(&rig, "desktop_unlocked"), json!({"reason": "snooze"}));
+    }
+
+    #[test]
+    fn skip_unlocks_with_its_reason_and_restarts_the_full_interval() {
+        let rig = rig(LIFTS, Some(FakeHub::new(vec![])), false);
+        lock(&rig);
+        let snapshot = rig.life.skip().unwrap();
+        assert_eq!(snapshot.phase, Phase::Coding);
+        assert_eq!(snapshot.remaining_seconds, 1500.0);
+        assert_eq!(rig.life.core().store.setting("snooze_until", ""), "0");
+        assert_eq!(payload(&rig, "desktop_unlocked"), json!({"reason": "skip"}));
+
+        // Not during a set: the way out of a set is finish or cancel.
+        start(&rig);
+        let published = rig.wire().len();
+        for rejected in [rig.life.skip(), rig.life.snooze(5)] {
+            assert_eq!(rejected.unwrap_err(), "Finish or stop the current workout first");
+        }
+        assert_eq!(rig.wire().len(), published);
+        assert!(rig.active());
     }
 }
