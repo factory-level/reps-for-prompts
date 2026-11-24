@@ -186,9 +186,6 @@ pub(crate) fn print_state(snap: &Snapshot) {
 pub(crate) fn emit_snapshot(app: &AppHandle, snap: &Snapshot) {
     if app.state::<Runtime>().is_stopping() { return; }
     print_state(snap);
-    // Durable history: phase changes publish their reps.* events through the
-    // hub (fire-and-forget; queues while the hub is down).
-    if !app.state::<Runtime>().is_debug() { hub::publish_phase_transition(snap); }
     // Debt owed → the programming monitor is locked (fullscreen, on top).
     windows::apply_lock(app, snap.phase != Phase::Coding);
     let _ = app.emit("snapshot", snap);
@@ -228,7 +225,7 @@ fn shutdown_runtime(app: &AppHandle) {
 /// Emergency escape remains available in enforced Workout mode.
 fn emergency_escape(app: AppHandle, state: State<SharedCore>) -> Snapshot {
     let mut core = state.lock().unwrap();
-    let _ = core.session.release(Release::Cancel, SystemClock.now());
+    hub::publish_facts(&core.session.release(Release::Cancel, SystemClock.now()));
     let minutes = core.store.setting("work_minutes", "25").parse().unwrap_or(25.);
     core.session.configure_timer(minutes, SystemClock.now());
     let snap = persist_and_snapshot(&mut core);
@@ -276,11 +273,11 @@ fn debug_mode(app: AppHandle, state: State<SharedCore>, mode: String, exercise: 
         if let Some(rx) = selected { core.session.debug_start_exercise(rx); }
         else {
             // Restart from any phase: drop the current set, then take the next.
-            let _ = core.session.release(Release::Cancel, clock.now());
-            let _ = core.session.start_workout(&clock.today());
+            hub::publish_facts(&core.session.release(Release::Cancel, clock.now()));
+            hub::publish_facts(&core.session.start_workout(&clock.today()));
         }
     } else {
-        let _ = core.session.release(Release::Cancel, clock.now());
+        hub::publish_facts(&core.session.release(Release::Cancel, clock.now()));
     }
     let snap = persist_and_snapshot(&mut core);
     drop(core);
@@ -302,7 +299,7 @@ fn simulate_progress(
     app.state::<Runtime>().require_debug()?;
     let mut core = state.lock().unwrap();
     let unit = "reps".to_string();
-    let _ = core.session.report_progress(Progress { value, unit, satisfied });
+    hub::publish_facts(&core.session.report_progress(Progress { value, unit, satisfied }));
     let snap = persist_and_snapshot(&mut core);
     drop(core);
     if satisfied { hub::disable_metric_async(&app); }
@@ -314,11 +311,7 @@ fn confirm_weight(app: AppHandle, state: State<SharedCore>, weight: f64) -> Snap
     let clock = SystemClock;
     let mut core = state.lock().unwrap();
     // persist_and_snapshot writes the pending record.
-    for fact in core.session.confirm_weight(weight, &clock.today()) {
-        if let engine::session::Fact::WeightLogged { exercise, weight } = fact {
-            hub::queue_event("weight_logged", serde_json::json!({"exercise": exercise, "weight": weight}));
-        }
-    }
+    hub::publish_facts(&core.session.confirm_weight(weight, &clock.today()));
     let snap = persist_and_snapshot(&mut core);
     drop(core);
     // Camera gating: confirming the weight ENDS the workout, so it must
@@ -658,7 +651,7 @@ pub fn run() {
                 let clock = SystemClock;
                 let state = handle.state::<SharedCore>();
                 if !handle.state::<Runtime>().is_debug() {
-                    let _ = state.lock().unwrap().session.start(clock.now(), &clock.today());
+                    hub::publish_facts(&state.lock().unwrap().session.start(clock.now(), &clock.today()));
                 }
             }
             std::thread::spawn(move || {
@@ -706,14 +699,16 @@ pub fn run() {
                         let changed={let state=handle.state::<control::SharedDisplay>();let mut display=state.lock().unwrap();display.notice.take().map(|_|display.clone())};
                         if let Some(display)=changed{let _=handle.emit("display-state",display);}
                     }
-                    let locked_now = !handle.state::<Runtime>().is_debug() && can_remind && !core.session.tick(now, &today).is_empty();
+                    let locked = if !handle.state::<Runtime>().is_debug() && can_remind { core.session.tick(now, &today) } else { vec![] };
+                    let locked_now = !locked.is_empty();
+                    hub::publish_facts(&locked);
                     let mut snap = core.session.snapshot(now);
                     if locked_now {
                         // Show the passive reminder; CLI starts the camera.
                         if !warn {daily::notify("Time for a little movement. Start your next workout from the terminal: rfp start".into());}
                         emit_snapshot(&handle, &snap);
                         if handle.state::<Runtime>().enforces_windows() {
-                            let _ = core.session.start_workout(&today);
+                            hub::publish_facts(&core.session.start_workout(&today));
                             snap = persist_and_snapshot(&mut core);
                             enable_metric_for(&handle, &snap);
                         } else if let Some(window) = handle.get_webview_window("main") {
@@ -724,7 +719,7 @@ pub fn run() {
                     if !handle.state::<Runtime>().is_debug() && snap.phase == Phase::Unlocked {
                         let since = *unlocked_since.get_or_insert(now);
                         if now - since >= 3.0 {
-                            let _ = core.session.resume_coding(now);
+                            hub::publish_facts(&core.session.resume_coding(now));
                             let minutes = core.store.setting("work_minutes", "25").parse().unwrap_or(25.);
                             core.session.configure_timer(minutes, now);
                             snap = persist_and_snapshot(&mut core);
