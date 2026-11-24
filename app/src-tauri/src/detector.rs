@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 
 use crate::hub::{APP_ID, WORKOUT_METRIC};
 
-pub const EXERCISE_SPECS: &str = include_str!("../resources/exercise_specs.json");
+const EXERCISE_SPECS: &str = include_str!("../resources/exercise_specs.json");
 /// Rep target of a debug set; the debug video stream counts to the same number.
 pub const DEBUG_TARGET_REPS: u32 = 10; // matches WorkoutEngine's default_reps
 
@@ -28,7 +28,7 @@ pub struct CameraSettings {
 /// frames rotated 180° — so the app must rotate identically or the joint
 /// angles are inverted and no rep crosses its thresholds.
 fn default_usb_rotation() -> u16 { 180 }
-pub fn phone_stream_url(value: &str) -> bool {
+fn phone_stream_url(value: &str) -> bool {
     ["rtsp://", "rtsps://", "http://", "https://"].iter().any(|prefix| value.starts_with(prefix))
 }
 impl Default for CameraSettings {
@@ -177,16 +177,10 @@ pub fn detector_request(
     Ok((request, camera_set))
 }
 
-/// `REPS_CAMERA_INDEX` and `REPS_CAMERA_ROTATE` (0/90/180/270).
-pub fn env_camera() -> (i64, Option<i64>) {
-    let number = |name| std::env::var(name).ok().and_then(|v: String| v.parse().ok());
-    (number("REPS_CAMERA_INDEX").unwrap_or(0), number("REPS_CAMERA_ROTATE"))
-}
-
 /// Read everything `detector_request` needs from the data directory and the
 /// environment. The only IO in this module.
 pub fn load_inputs(normal_home: &Path) -> Result<DetectorInputs, HonorReason> {
-    let (camera_index, camera_rotate) = env_camera();
+    let number = |name| std::env::var(name).ok().and_then(|value| value.parse().ok());
     Ok(DetectorInputs {
         specs: load_exercise_specs().map_err(HonorReason::BadSpecs)?,
         settings: load_camera_settings(normal_home),
@@ -194,14 +188,15 @@ pub fn load_inputs(normal_home: &Path) -> Result<DetectorInputs, HonorReason> {
             .map(|path| std::fs::read_to_string(path).map(|value| value.trim().to_string()).unwrap_or_default()),
         calibration: std::fs::read(normal_home.join("camera-calibration.json")).ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or(json!({})),
-        camera_index,
-        camera_rotate,
+        camera_index: number("REPS_CAMERA_INDEX").unwrap_or(0),
+        // 0/90/180/270, for setups not mounted like the rig.
+        camera_rotate: number("REPS_CAMERA_ROTATE"),
     })
 }
 
 /// The enable_metric config for a prescription: shipped exercise definition
 /// + targets + the single env-selected camera.
-pub fn metric_config_for(
+fn metric_config_for(
     specs: &Value,
     exercise: &str,
     target_reps: u32,
@@ -246,7 +241,7 @@ pub struct CameraSet {
 
 /// Given a camera-set block, strip the injected single-camera object, put the
 /// fusion policy into the config, and return the set.
-pub fn apply_camera_set(block: Option<&Value>, config: &mut Value) -> Option<CameraSet> {
+fn apply_camera_set(block: Option<&Value>, config: &mut Value) -> Option<CameraSet> {
     let block = block?;
     let cameras: Vec<String> = block
         .get("set")
