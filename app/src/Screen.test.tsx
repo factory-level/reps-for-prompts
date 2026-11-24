@@ -18,7 +18,8 @@ describe("gym monitor", () => {
   it("a live set shows done / target as the biggest number", () => {
     render(<Screen snapshot={{ ...base, phase: "WORKOUT_ACTIVE", prescription: press, progress: { value: 8.4, unit: "reps", satisfied: false } }} app={app} />);
     expect(screen.getByText("08 / 12")).toBeInTheDocument();
-    expect(screen.getByText("DUMBBELL PRESS")).toBeInTheDocument();
+    expect(screen.getByText("MOVE")).toBeInTheDocument();
+    expect(screen.getByText("Dumbbell press")).toBeInTheDocument();
   });
   it("timed sets count in mm:ss", () => {
     render(<Screen snapshot={{ ...base, phase: "WORKOUT_ACTIVE", prescription: { ...press, kind: "CONTINUOUS", targetReps: 0, targetSeconds: 60 }, progress: { value: 32, unit: "seconds", satisfied: false } }} app={app} />);

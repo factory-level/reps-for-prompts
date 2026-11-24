@@ -98,7 +98,8 @@ function view(snapshot: Snapshot, app: AppState | null, vision: Vision | undefin
       const manual = vision?.state === "unavailable";
       const value = Math.floor(snapshot.progress?.value ?? 0);
       return {
-        mode: "workout", word: debug ? "TEST WORKOUT" : label.toUpperCase() || "WORKOUT", lines: [
+        mode: "workout", word: debug ? "TEST WORKOUT" : "MOVE", lines: [
+          <span key="h" className="medium">{label}</span>,
           <span key="a" className="big">{reps ? `${String(value).padStart(2, "0")} / ${target}` : `${mmss(value)} / ${mmss(target)}`}</span>,
           <span key="b" className="small">{manual ? "MANUAL MODE · finish on your computer" : `${setOf} · ${reps ? "reps" : "seconds"}`}</span>,
         ],
