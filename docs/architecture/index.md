@@ -40,6 +40,11 @@ flowchart LR
 | Packaging | [bundle-hub.sh](../../scripts/bundle-hub.sh): staged hub, plugin, model and consumer artifacts; [package evidence](../production/package-verification.md) |
 | Install | [install-dogfood.py](../../scripts/install-dogfood.py): `~/.local/lib/rfp`, the `rfp.service` systemd user unit, and a login autostart entry |
 
+`DebugPanel` and the other in-window debug/settings components were deleted,
+deviating from the hub-as-sdk spec's "DebugPanel deferred, not deleted" note.
+The capability survives via `rfp debug video`, `PassivePreview` and
+`debug_stream_start`.
+
 The app has no tray icon. Tauri's `tray-icon` feature is enabled, but nothing
 creates a tray.
 
