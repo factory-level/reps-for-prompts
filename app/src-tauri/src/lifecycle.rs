@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use engine::clock::Clock;
 use engine::session::{Fact, Release};
-use engine::types::{Phase, Progress, Snapshot};
+use engine::types::{Phase, Prescription, Progress, Snapshot};
 use hub_client::outbox::Publication;
 use hub_client::VisionEvent;
 use serde_json::{json, Value};
@@ -357,12 +357,44 @@ impl Lifecycle {
         if self.previewing() { self.release_camera(); }
     }
 
-    pub(crate) fn persist(&self, core: &mut Core) -> Snapshot {
-        persist_and_snapshot(core, self.clock.now())
+    // ---- Debug mode's manual controls ---------------------------------------
+
+    fn require_debug(&self) -> Result<(), String> {
+        if self.debug { Ok(()) } else { Err("Manual testing requires Debug mode".into()) }
     }
 
-    pub(crate) fn emit(&self, snapshot: &Snapshot) {
-        self.effects.snapshot(snapshot);
+    /// Start a set now, from any phase: the selected exercise, or — `None` —
+    /// the next one owed after dropping the current set.
+    pub fn debug_start(&self, exercise: Option<Prescription>) -> Result<Snapshot, String> {
+        self.require_debug()?;
+        self.release_camera();
+        self.step(|core, now, today| Ok(match exercise {
+            Some(prescription) => core.session.debug_start_exercise(prescription),
+            None => {
+                let mut facts = core.session.release(Release::Cancel, now);
+                facts.extend(core.session.start_workout(today));
+                facts
+            }
+        }))
+    }
+
+    /// Drop the current set and go back to coding.
+    pub fn debug_stop(&self) -> Result<Snapshot, String> {
+        self.require_debug()?;
+        self.release_camera();
+        self.step(|core, now, _| Ok(core.session.release(Release::Cancel, now)))
+    }
+
+    /// Stand in for the camera: report `value` reps (default: one more), or
+    /// the target reached.
+    pub fn debug_progress(&self, value: Option<f64>, satisfied: bool) -> Result<Snapshot, String> {
+        self.require_debug()?;
+        self.step(|core, now, _| {
+            let snapshot = core.session.snapshot(now);
+            if snapshot.phase != Phase::WorkoutActive { return Err("Start a debug workout first".into()); }
+            let value = value.unwrap_or(snapshot.progress.map(|p| p.value).unwrap_or(0.) + 1.);
+            Ok(core.session.report_progress(Progress { value, unit: "reps".into(), satisfied }))
+        })
     }
 
     // ---- Durable publishing ------------------------------------------------
@@ -380,7 +412,7 @@ impl Lifecycle {
 
     /// Publish the durable events for the facts a session transition returned,
     /// in order, and keep the session id in step with them.
-    pub(crate) fn publish_facts(&self, facts: &[Fact]) {
+    fn publish_facts(&self, facts: &[Fact]) {
         for fact in facts {
             // Each lock cycle is one session: minted at the lock, closed once
             // the return to coding is recorded.
@@ -417,7 +449,7 @@ impl Lifecycle {
     /// failure signals the vision status so the UI offers honor mode.
     /// A preview runs under a session id of its own that is never the
     /// workout's, so none of its frames can count toward a set.
-    pub(crate) fn enable(&self, exercise: String, target_reps: u32, target_seconds: f64, preview: bool) {
+    fn enable(&self, exercise: String, target_reps: u32, target_seconds: f64, preview: bool) {
         let (generation, session) = {
             let mut gate = self.gate.lock().unwrap();
             gate.generation += 1;
@@ -493,7 +525,7 @@ impl Lifecycle {
     }
 
     /// Release the camera. Fire-and-forget.
-    pub(crate) fn disable(&self) {
+    fn disable(&self) {
         let (generation, session) = self.detector_off();
         let this = self.clone();
         self.run(move || {
@@ -511,8 +543,8 @@ impl Lifecycle {
     }
 
     /// Release the camera before returning, with no `detector_stopped` event:
-    /// preview and debug teardown.
-    pub(crate) fn release_camera(&self) {
+    /// preview and debug teardown, and the debug video stream taking over.
+    pub fn release_camera(&self) {
         self.detector_off();
         if let Some(hub) = self.hub.lock().unwrap().as_mut() { let _ = hub.disable_metric(WORKOUT_METRIC); }
     }
@@ -1083,5 +1115,31 @@ mod tests {
         assert!(!tick(&rig, 5000.0, reminding()).1);
         assert_eq!(rig.life.snapshot().phase, Phase::Coding);
         assert!(rig.types().is_empty());
+    }
+
+    #[test]
+    fn debug_controls_drive_a_set_by_hand_and_publish_nothing() {
+        let rig = rig(LIFTS, Some(FakeHub::new(vec![])), true);
+        let squat = detector::debug_exercise_options().unwrap().into_iter().find(|rx| rx.exercise == "squat");
+        assert_eq!(rig.life.debug_progress(None, false).unwrap_err(), "Start a debug workout first");
+
+        assert_eq!(rig.life.debug_start(squat).unwrap().phase, Phase::WorkoutActive);
+        assert!(rig.active());
+        assert_eq!(rig.life.debug_progress(None, false).unwrap().progress.unwrap().value, 1.0);
+        assert_eq!(rig.life.debug_progress(Some(7.0), false).unwrap().progress.unwrap().value, 7.0);
+        assert_eq!(rig.life.debug_progress(None, true).unwrap().phase, Phase::WeightConfirmation);
+        assert!(!rig.active());
+
+        // Restart with the next set owed, then stop.
+        assert_eq!(rig.life.debug_start(None).unwrap().phase, Phase::WorkoutActive);
+        assert!(rig.active());
+        assert_eq!(rig.life.debug_stop().unwrap().phase, Phase::Coding);
+        assert!(!rig.active());
+        assert!(rig.types().is_empty());
+
+        let workout = self::rig(LIFTS, None, false);
+        assert_eq!(workout.life.debug_start(None).unwrap_err(), "Manual testing requires Debug mode");
+        assert_eq!(workout.life.debug_stop().unwrap_err(), "Manual testing requires Debug mode");
+        assert_eq!(workout.life.debug_progress(None, true).unwrap_err(), "Manual testing requires Debug mode");
     }
 }

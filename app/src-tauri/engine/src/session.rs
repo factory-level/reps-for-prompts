@@ -240,7 +240,8 @@ impl Session {
 
     /// Start a manually selected detector test, independent of the daily plan.
     /// The desktop caller must require Debug mode and use its isolated store.
-    pub fn debug_start_exercise(&mut self, prescription: Prescription) {
+    #[must_use]
+    pub fn debug_start_exercise(&mut self, prescription: Prescription) -> Vec<Fact> {
         self.timer.stop();
         self.plan = None;
         self.pending_record = None;
@@ -248,6 +249,7 @@ impl Session {
         self.verified = false;
         self.prescription = Some(prescription);
         self.phase = Phase::WorkoutActive;
+        vec![Fact::Started]
     }
 
     pub fn take_pending_record(&mut self) -> Option<SetRecord> {
@@ -499,8 +501,8 @@ mod tests {
         let mut s = session();
         let _ = s.start_workout("2026-09-15");
         let _ = s.report_progress(Progress { value: 3.0, unit: "reps".into(), satisfied: false });
-        s.debug_start_exercise(Prescription { exercise: "jumprope".into(), kind: ExerciseKind::Continuous,
-            target_reps: 0, target_seconds: 60.0, default_weight: 0.0 });
+        assert_eq!(s.debug_start_exercise(Prescription { exercise: "jumprope".into(), kind: ExerciseKind::Continuous,
+            target_reps: 0, target_seconds: 60.0, default_weight: 0.0 }), vec![Fact::Started]);
         let snap = s.snapshot(1000.0);
         assert_eq!(snap.phase, Phase::WorkoutActive);
         assert!(snap.progress.is_none());

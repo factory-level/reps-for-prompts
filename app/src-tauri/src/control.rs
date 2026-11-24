@@ -71,16 +71,15 @@ fn dispatch(app:&AppHandle, command:Command)->Result<serde_json::Value,String>{
    app.state::<Runtime>().require_debug()?;
    match operation.as_str(){
     "history"=>{let life=app.state::<Lifecycle>();let core=life.core();return Ok(serde_json::json!({"source":"debug","records":core.store.records(None,None,0,100,false).map_err(|e|e.to_string())?}));},
-    "exercises"=>return serde_json::to_value(crate::debug_exercises(app.clone())?).map_err(|e|e.to_string()),
+    "exercises"=>return serde_json::to_value(crate::detector::debug_exercise_options()?).map_err(|e|e.to_string()),
     "videos"=>return serde_json::to_value(crate::debug_videos(app.clone())?).map_err(|e|e.to_string()),
-    "start"=>{stop_preview(app);crate::debug_mode(app.clone(),app.state::<Lifecycle>(),"workout".into(),exercise)?;show(app);},
-    "stop"=>{stop_preview(app);crate::debug_mode(app.clone(),app.state::<Lifecycle>(),"coding".into(),None)?;},
-    "step"|"done"=>{
-     let snap=app.state::<Lifecycle>().snapshot();
-     if snap.phase!=Phase::WorkoutActive{return Err("Start a debug workout first".into());}
-     crate::simulate_progress(app.clone(),app.state::<Lifecycle>(),value.unwrap_or(snap.progress.map(|p|p.value).unwrap_or(0.)+1.),operation=="done")?;
+    "start"=>{
+     let selected=exercise.map(|name|crate::detector::debug_exercise_options()?.into_iter().find(|rx|rx.exercise==name).ok_or_else(||format!("Unknown exercise: {name}"))).transpose()?;
+     view(app,"screen",false);crate::stop_debug_process(app);app.state::<Lifecycle>().debug_start(selected)?;show(app);
     },
-    "video"=>{stop_preview(app);view(app,"video",false);show(app);crate::debug_stream_start(app.clone(),app.state::<crate::SharedDebugProcess>(),video.ok_or("Supply --file PATH")?,exercise.ok_or("Supply --exercise NAME")?)?;},
+    "stop"=>{view(app,"screen",false);crate::stop_debug_process(app);app.state::<Lifecycle>().debug_stop()?;},
+    "step"|"done"=>{app.state::<Lifecycle>().debug_progress(value,operation=="done")?;},
+    "video"=>{stop_preview(app);view(app,"video",false);show(app);crate::debug_stream_start(app.clone(),video.ok_or("Supply --file PATH")?,exercise.ok_or("Supply --exercise NAME")?)?;},
     "video-stop"=>{crate::stop_debug_process(app);view(app,"screen",false);},_=>unreachable!()
    }
   },

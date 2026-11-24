@@ -8,10 +8,10 @@ use std::time::Duration;
 
 use engine::clock::{Clock, SystemClock};
 use engine::plan::DailyPlan;
-use engine::session::{Release, Session};
+use engine::session::Session;
 use engine::store::{default_continuous_pool, Store};
 use engine::timer::CodingTimer;
-use engine::types::{ExerciseKind, Phase, Prescription, Progress, Snapshot};
+use engine::types::{ExerciseKind, Phase, Snapshot};
 use engine::workout::WorkoutEngine;
 use serde::{Deserialize, Serialize};
 
@@ -176,14 +176,6 @@ impl lifecycle::Effects for TauriEffects {
     fn publish(&self, publication: hub_client::outbox::Publication) { hub::queue(publication); }
 }
 
-/// Camera on only while working out: enable the metric for the prescription
-/// (fire-and-forget; failure surfaces honor mode).
-fn enable_metric_for(life: &Lifecycle, snap: &Snapshot) {
-    if let Some(rx) = snap.prescription.as_ref() {
-        life.enable(rx.exercise.clone(), rx.target_reps, rx.target_seconds, false);
-    }
-}
-
 #[tauri::command]
 fn get_snapshot(state: State<Lifecycle>) -> Snapshot {
     state.snapshot()
@@ -204,64 +196,6 @@ fn shutdown_runtime(app: &AppHandle) {
     stop_debug_process(app);
     hub::stop(app);
     app.state::<Runtime>().cleanup();
-}
-
-fn debug_exercises(app: AppHandle) -> Result<Vec<Prescription>, String> {
-    app.state::<Runtime>().require_debug()?;
-    detector::debug_exercise_options()
-}
-
-/// DEBUG: force the session between "coding" and "workout" without waiting out
-/// the coding timer, and flip the camera to match. Lets you exercise live
-/// detection on demand from the debug toggle.
-fn debug_mode(app: AppHandle, state: State<Lifecycle>, mode: String, exercise: Option<String>) -> Result<Snapshot, String> {
-    app.state::<Runtime>().require_debug()?;
-    if mode != "workout" && mode != "coding" { return Err("Unknown test action".into()); }
-    let selected = if mode == "workout" {
-        exercise.map(|name| detector::debug_exercise_options()?.into_iter().find(|rx| rx.exercise == name)
-            .ok_or_else(|| format!("Unknown exercise: {name}"))).transpose()?
-    } else { None };
-    stop_debug_process(&app);
-    state.release_camera();
-    let clock = SystemClock;
-    let mut core = state.core();
-    let workout = mode == "workout";
-    if workout {
-        if let Some(rx) = selected { core.session.debug_start_exercise(rx); }
-        else {
-            // Restart from any phase: drop the current set, then take the next.
-            state.publish_facts(&core.session.release(Release::Cancel, clock.now()));
-            state.publish_facts(&core.session.start_workout(&clock.today()));
-        }
-    } else {
-        state.publish_facts(&core.session.release(Release::Cancel, clock.now()));
-    }
-    let snap = state.persist(&mut core);
-    drop(core);
-    if workout {
-        enable_metric_for(&state, &snap);
-    } else {
-        state.disable();
-    }
-    state.emit(&snap);
-    Ok(snap)
-}
-
-fn simulate_progress(
-    app: AppHandle,
-    state: State<Lifecycle>,
-    value: f64,
-    satisfied: bool,
-) -> Result<Snapshot, String> {
-    app.state::<Runtime>().require_debug()?;
-    let mut core = state.core();
-    let unit = "reps".to_string();
-    state.publish_facts(&core.session.report_progress(Progress { value, unit, satisfied }));
-    let snap = state.persist(&mut core);
-    drop(core);
-    if satisfied { state.disable(); }
-    state.emit(&snap);
-    Ok(snap)
 }
 
 // ---------------------------------------------------------------------------
@@ -378,13 +312,9 @@ fn should_store_spawn(current_generation: u64, my_generation: u64) -> bool {
     current_generation == my_generation
 }
 
-fn debug_stream_start(
-    app: AppHandle,
-    state: State<SharedDebugProcess>,
-    video: String,
-    exercise: String,
-) -> Result<(), String> {
+fn debug_stream_start(app: AppHandle, video: String, exercise: String) -> Result<(), String> {
     app.state::<Runtime>().require_debug()?;
+    let state = app.state::<SharedDebugProcess>();
     if !Path::new(&video).is_file() { return Err("Video is missing; choose an available fixture".into()); }
     let (vision_dir, plugin_dir, model) = if cfg!(debug_assertions) {
         let dir = vision_dir()?;

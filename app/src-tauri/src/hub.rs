@@ -1,8 +1,8 @@
-//! Vision-hub integration: RFP declares its model and workout
-//! configs (resources/exercise_specs.json) and drives the bundled hub via
-//! the `VisionHub` trait — enable metric on workout start, pump events into
-//! the session, disable on completion. Honor-mode fallback when the hub is
-//! down: never strand the user, never phantom reps.
+//! Vision-hub integration: supervise the bundled hub, pump its events into
+//! the `Lifecycle`, and deliver the lifecycle's publications through the
+//! durable queue. What the hub is asked to do during a workout — enable the
+//! detector on start, disable it on completion, honor mode when the hub is
+//! down — is decided in `lifecycle.rs`.
 
 use std::sync::{Arc, Mutex};
 
