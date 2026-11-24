@@ -8,8 +8,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use engine::clock::Clock;
 use engine::session::{Fact, Release};
-use engine::types::{Phase, Snapshot};
+use engine::types::{Phase, Progress, Snapshot};
 use hub_client::outbox::Publication;
+use hub_client::VisionEvent;
 use serde_json::{json, Value};
 
 use crate::detector::{self, DetectorInputs, HonorReason};
@@ -219,6 +220,43 @@ impl Lifecycle {
         })
     }
 
+    /// One event from the hub's stream. A progress frame counts only for the
+    /// set it was measured for: the detector must be on for a set (not a
+    /// preview) and the frame must carry this lock cycle's session id.
+    pub fn progress(&self, event: VisionEvent) {
+        match event {
+            VisionEvent::Progress { value, unit, satisfied, context } => {
+                // A disconnected marker repeats the last value, so it credits nothing new.
+                let disconnected = context.camera_status.as_deref() == Some("disconnected")
+                    || context.consensus.as_ref().is_some_and(|c| c["state"] == "disconnected");
+                // Checked under the session lock, so a late frame cannot slip
+                // into the set that follows a cancel or a preview.
+                let _ = self.step(|core, _, _| {
+                    let counts = {
+                        let gate = self.gate.lock().unwrap();
+                        gate.active && !gate.preview && context.belongs_to(WORKOUT_METRIC, gate.session_id.as_deref())
+                    };
+                    if !counts { return Err("ignored".into()); }
+                    self.signal(if disconnected { Signal::CameraDisconnected } else { Signal::LiveFrame });
+                    Ok(core.session.report_progress(Progress { value, unit, satisfied }))
+                });
+            }
+            VisionEvent::CameraFrame { camera_id, data } => {
+                if self.gate.lock().unwrap().active { self.effects.camera_frame(&camera_id, &data); }
+            }
+            VisionEvent::Semantic { kind, .. } => {
+                if (kind == "detector_error" || kind == "stream_ended") && self.gate.lock().unwrap().active {
+                    self.signal(Signal::DetectorFailed(kind));
+                }
+            }
+            VisionEvent::Health(health) => {
+                if health.vision_host == "down" { self.signal(Signal::HubDown); }
+            }
+            VisionEvent::ConnectionLost => self.signal(Signal::ConnectionLost),
+            VisionEvent::Landmarks(_) => {}
+        }
+    }
+
     /// Complete the set: log the weight once the target was reached, or —
     /// `honor` — attest a set the camera could not verify. Honor completion
     /// always works during an active workout.
@@ -273,18 +311,6 @@ impl Lifecycle {
 
     pub(crate) fn emit(&self, snapshot: &Snapshot) {
         self.effects.snapshot(snapshot);
-    }
-
-    pub(crate) fn detector_active(&self) -> bool {
-        self.gate.lock().unwrap().active
-    }
-
-    pub(crate) fn camera_frame(&self, camera_id: &str, data: &Value) {
-        self.effects.camera_frame(camera_id, data);
-    }
-
-    pub(crate) fn session_id(&self) -> Option<String> {
-        self.gate.lock().unwrap().session_id.clone()
     }
 
     // ---- Durable publishing ------------------------------------------------
@@ -566,6 +592,21 @@ mod tests {
         rig.life.step(|core, now, today| Ok(core.session.tick(now, today))).unwrap()
     }
 
+    /// A progress frame as the hub stamps it for `session`.
+    fn frame(session: Option<String>, value: f64, unit: &str, satisfied: bool) -> VisionEvent {
+        VisionEvent::Progress {
+            value, unit: unit.into(), satisfied,
+            context: hub_client::ProgressContext { metric_id: Some(WORKOUT_METRIC.into()), session_id: session, ..Default::default() },
+        }
+    }
+
+    fn session(rig: &Rig) -> Option<String> { rig.life.gate.lock().unwrap().session_id.clone() }
+
+    /// The camera counts `value` reps of the current set.
+    fn reps(rig: &Rig, value: f64, satisfied: bool) {
+        rig.life.progress(frame(session(rig), value, "reps", satisfied));
+    }
+
     fn payload(rig: &Rig, event_type: &str) -> Value {
         rig.effects.0.lock().unwrap().published.iter().rev().find_map(|publication| match publication {
             Publication::Event(p) if p["type"] == event_type => Some(p["payload"].clone()),
@@ -762,5 +803,163 @@ mod tests {
             rig.life.preview_on().unwrap_err(),
             "Finish, skip, or cancel the current break before starting camera preview",
         );
+    }
+
+    #[test]
+    fn a_verified_set_runs_start_to_finish_under_one_session() {
+        let rig = rig(LIFTS, Some(FakeHub::new(vec![])), false);
+        start(&rig);
+        reps(&rig, 3.0, false);
+        assert_eq!(rig.life.snapshot().progress.unwrap().value, 3.0);
+        assert!(rig.active());
+
+        reps(&rig, 5.0, true);
+        // Target reached: the camera is released before the weight is asked for.
+        assert_eq!(rig.life.snapshot().phase, Phase::WeightConfirmation);
+        assert!(!rig.active());
+        assert_eq!(rig.calls().last().unwrap(), "disable:workout");
+
+        assert_eq!(rig.life.finish(95.0, false).unwrap().phase, Phase::Unlocked);
+        assert_eq!(rig.verified(), vec![true]);
+        assert_eq!(payload(&rig, "weight_logged"), json!({"exercise": "squat", "weight": 95.0}));
+        assert_eq!(rig.types(), [&LOCK[..], &[
+            "detector_started", "detector_stopped", "weight_logged", "workout_completed", "desktop_unlocked",
+        ]].concat());
+        let wire = rig.wire();
+        assert!(wire[0].1.is_some());
+        assert!(wire.iter().all(|(_, session)| *session == wire[0].1));
+    }
+
+    #[test]
+    fn an_honor_set_does_not_make_the_next_set_unverified() {
+        let rig = rig(LIFTS, Some(FakeHub::new(vec![])), false);
+        start(&rig);
+        rig.life.finish(95.0, true).unwrap();
+        rig.life.cancel();
+        assert_eq!(rig.verified(), vec![false]);
+
+        start(&rig);
+        reps(&rig, 5.0, true);
+        rig.life.finish(95.0, false).unwrap();
+        let mut verified = rig.verified();
+        verified.sort();
+        assert_eq!(verified, vec![false, true]);
+        assert_eq!(rig.types().iter().filter(|event_type| *event_type == "override_used").count(), 1);
+    }
+
+    #[test]
+    fn preview_frames_never_reach_a_set() {
+        let rig = rig(LIFTS, Some(FakeHub::new(vec![])), false);
+        rig.life.preview_on().unwrap();
+        let preview_session = rig.wire()[0].1.clone();
+        let emitted = rig.effects.0.lock().unwrap().snapshots.len();
+        rig.life.progress(frame(preview_session.clone(), 100000.0, "reps", true));
+        assert_eq!(rig.effects.0.lock().unwrap().snapshots.len(), emitted);
+
+        start(&rig);
+        // A frame the preview stream produced, arriving after the set began.
+        rig.life.progress(frame(preview_session, 100000.0, "reps", true));
+        rig.life.progress(frame(None, 5.0, "reps", true));
+        let snapshot = rig.life.snapshot();
+        assert_eq!(snapshot.phase, Phase::WorkoutActive);
+        assert!(snapshot.progress.is_none());
+        assert!(rig.active());
+    }
+
+    #[test]
+    fn without_a_hub_the_set_is_unavailable_but_honor_still_completes_it() {
+        for hub in [None, Some({ let mut hub = FakeHub::new(vec![]); hub.fail_next_enable = true; hub })] {
+            let reason = if hub.is_some() { "hub is down" } else { "hub not running" };
+            let rig = rig(LIFTS, hub, false);
+            assert_eq!(start(&rig).phase, Phase::WorkoutActive);
+            assert_eq!(rig.life.vision_status(), VisionStatus::Unavailable { reason: reason.into() });
+            assert_eq!(rig.effects.0.lock().unwrap().vision.last().unwrap(), &rig.life.vision_status());
+            assert_eq!(payload(&rig, "system_error"), json!({"stage": "enable_metric", "error": reason}));
+            assert!(!rig.active());
+
+            // No detector, so no frame is this set's: no phantom progress.
+            reps(&rig, 5.0, true);
+            assert!(rig.life.snapshot().progress.is_none());
+            assert_eq!(rig.life.snapshot().phase, Phase::WorkoutActive);
+
+            assert_eq!(rig.life.finish(95.0, true).unwrap().phase, Phase::Unlocked);
+            assert_eq!(rig.verified(), vec![false]);
+            assert_eq!(rig.types(), [&LOCK[..], &[
+                "system_error", "override_used", "weight_logged", "workout_completed", "desktop_unlocked",
+            ]].concat());
+            // The set is over: the detector-level error goes with it.
+            assert_ne!(rig.life.vision_status(), VisionStatus::Unavailable { reason: reason.into() });
+        }
+    }
+
+    #[test]
+    fn a_late_frame_after_cancel_is_ignored() {
+        let rig = rig(LIFTS, Some(FakeHub::new(vec![])), false);
+        start(&rig);
+        let cancelled = session(&rig);
+        rig.life.cancel();
+        let emitted = rig.effects.0.lock().unwrap().snapshots.len();
+        rig.life.progress(frame(cancelled.clone(), 5.0, "reps", true));
+        assert_eq!(rig.effects.0.lock().unwrap().snapshots.len(), emitted);
+        assert_eq!(rig.life.snapshot().phase, Phase::Coding);
+
+        // Nor does it count toward the set started next.
+        start(&rig);
+        rig.life.progress(frame(cancelled, 5.0, "reps", true));
+        assert_eq!(rig.life.snapshot().phase, Phase::WorkoutActive);
+        assert!(rig.life.snapshot().progress.is_none());
+    }
+
+    #[test]
+    fn a_superseded_enable_changes_nothing_when_it_finally_reports() {
+        let rig = rig(LIFTS, Some(FakeHub::new(vec![])), false);
+        start(&rig);
+        let stale = rig.life.gate.lock().unwrap().generation - 1;
+        let (published, calls) = (rig.wire().len(), rig.calls().len());
+
+        // Its failure: no system_error, no "unavailable", the detector stays on.
+        // (A timed set of an unknown exercise has no spec to run.)
+        rig.life.enable_now(stale, "sess-stale", "no-such-exercise", 0, 30.0);
+        // Its turn at the hub: it does not touch the running detector.
+        rig.life.enable_now(stale, "sess-stale", "squat", 5, 0.0);
+
+        assert_eq!(rig.life.vision_status(), VisionStatus::Available);
+        assert!(rig.active());
+        assert_eq!((rig.wire().len(), rig.calls().len()), (published, calls));
+    }
+
+    #[test]
+    fn a_timed_set_completes_without_weight_confirmation() {
+        let rig = rig(r#"{"conditioning":[{"exercise":"jumprope","seconds":60}]}"#, Some(FakeHub::new(vec![])), false);
+        start(&rig);
+        rig.life.progress(frame(session(&rig), 60.0, "seconds", true));
+        assert_eq!(rig.life.snapshot().phase, Phase::Unlocked);
+        assert!(!rig.active());
+        let history = rig.life.core().store.history(10).unwrap();
+        assert_eq!((history[0].exercise.as_str(), history[0].seconds, history[0].verified), ("jumprope", 60.0, true));
+        assert_eq!(rig.types(), [&LOCK[..], &[
+            "detector_started", "workout_completed", "desktop_unlocked", "detector_stopped",
+        ]].concat());
+    }
+
+    #[test]
+    fn stream_trouble_reaches_the_vision_status_and_frames_flow_only_while_the_detector_runs() {
+        let rig = rig(LIFTS, Some(FakeHub::new(vec![])), false);
+        let camera = || VisionEvent::CameraFrame { camera_id: "webcam".into(), data: json!({}) };
+        let ended = || VisionEvent::Semantic { kind: "stream_ended".into(), payload: json!({}) };
+        rig.life.progress(camera());
+        rig.life.progress(ended());
+        assert_eq!(rig.effects.0.lock().unwrap().frames, 0);
+        assert_eq!(rig.life.vision_status(), VisionStatus::Starting);
+
+        start(&rig);
+        rig.life.progress(camera());
+        assert_eq!(rig.effects.0.lock().unwrap().frames, 1);
+        rig.life.progress(ended());
+        assert_eq!(rig.life.vision_status(), VisionStatus::Unavailable { reason: "stream_ended".into() });
+        reps(&rig, 1.0, false);
+        assert_eq!(rig.life.vision_status(), VisionStatus::Available);
+        rig.life.progress(VisionEvent::ConnectionLost);
+        assert_eq!(rig.life.vision_status(), VisionStatus::Unavailable { reason: "Vision hub connection lost".into() });
     }
 }

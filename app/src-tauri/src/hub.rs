@@ -7,7 +7,6 @@
 use std::sync::{Arc, Mutex};
 
 use engine::session::{Fact, Release};
-use engine::types::Progress;
 use hub_client::{EnableMetric, HubSupervisor, HubSupervisorConfig, VisionEvent, VisionHub};
 use tauri::{AppHandle, Manager};
 
@@ -325,49 +324,27 @@ fn print_detect(data: &serde_json::Value) {
     }
 }
 
+/// Feed the hub's event stream to the lifecycle; the terminal lines and the
+/// display's last error are this adapter's own.
 fn pump_events(app: AppHandle, rx: std::sync::mpsc::Receiver<VisionEvent>) {
     let life = app.state::<Lifecycle>();
     for event in rx {
         if app.state::<crate::Runtime>().is_stopping() { break; }
-        match event {
+        match &event {
             // Landmarks are terminal-only now: nothing in the webviews listens,
             // and pushing them at camera rate into both windows leaked memory.
-            VisionEvent::CameraFrame { camera_id, data } => {
-                if life.detector_active() { life.camera_frame(&camera_id, &data); }
-            }
-            VisionEvent::Landmarks(data) => print_detect(&data),
-            VisionEvent::Progress { value, unit, satisfied, context } => {
-                if !life.detector_active() || life.previewing() { continue; }
-                if !context.belongs_to(WORKOUT_METRIC, life.session_id().as_deref()) {
-                    continue;
-                }
-                // A disconnected marker repeats the last value, so it credits nothing new.
-                let disconnected = context.camera_status.as_deref() == Some("disconnected")
-                    || context.consensus.as_ref().is_some_and(|c| c["state"] == "disconnected");
-                signal(&app, if disconnected { Signal::CameraDisconnected } else { Signal::LiveFrame });
-                let mut core = life.core();
-                life.publish_facts(&core.session.report_progress(Progress { value, unit, satisfied }));
-                let snap = life.persist(&mut core);
-                drop(core);
-                life.emit(&snap);
-                if satisfied {
-                    life.disable();
-                }
-            }
+            VisionEvent::Landmarks(data) => print_detect(data),
             VisionEvent::Semantic { kind, payload } => {
                 if kind == "detector_error" || kind == "stream_ended" {
-                    crate::control::error(&app,format!("{kind}: {payload}"));
-                    if life.detector_active() { signal(&app, Signal::DetectorFailed(kind.clone())); }
+                    crate::control::error(&app, format!("{kind}: {payload}"));
                 }
                 if kind == "rep_completed" || kind == "target_reached" {
                     println!("[DETECT] ✓ {}", kind);
                 }
             }
-            VisionEvent::Health(health) => {
-                if health.vision_host == "down" { signal(&app, Signal::HubDown); }
-            }
-            VisionEvent::ConnectionLost => signal(&app, Signal::ConnectionLost),
+            _ => {}
         }
+        life.progress(event);
     }
 }
 
