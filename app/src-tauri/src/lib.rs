@@ -211,31 +211,6 @@ fn get_snapshot(state: State<SharedCore>) -> Snapshot {
 #[tauri::command]
 fn get_app_mode(app: AppHandle) -> AppMode { app.state::<Runtime>().mode }
 
-#[tauri::command]
-fn show_gym(app: AppHandle) -> Result<(), String> {
-    if app.state::<Runtime>().is_stopping() { return Err("Application is restarting".into()); }
-    let gym = app.get_webview_window("gym").ok_or("Gym window unavailable")?;
-    gym.show().map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn set_app_mode(app: AppHandle, mode: AppMode) -> Result<(), String> {
-    static SWITCH: Mutex<()> = Mutex::new(());
-    let _guard = SWITCH.try_lock().map_err(|_| "Mode change already in progress")?;
-    let runtime = app.state::<Runtime>();
-    if runtime.is_stopping() { return Err("Application is restarting".into()); }
-    if runtime.mode == mode { return Ok(()); }
-    runtime.save_mode(mode)?;
-    runtime.begin_stop();
-    windows::release(&app);
-    let handle = app.clone();
-    std::thread::spawn(move || {
-        shutdown_runtime(&handle);
-        handle.restart();
-    });
-    Ok(())
-}
-
 fn stop_debug_process(app: &AppHandle) {
     let state = app.state::<SharedDebugProcess>();
     let mut guard = state.lock().unwrap();
@@ -251,7 +226,6 @@ fn shutdown_runtime(app: &AppHandle) {
 }
 
 /// Emergency escape remains available in enforced Workout mode.
-#[tauri::command]
 fn emergency_escape(app: AppHandle, state: State<SharedCore>) -> Snapshot {
     let mut core = state.lock().unwrap();
     core.session.debug_force_coding(SystemClock.now());
@@ -262,18 +236,6 @@ fn emergency_escape(app: AppHandle, state: State<SharedCore>) -> Snapshot {
     hub::disable_metric_async(&app);
     emit_snapshot(&app, &snap);
     snap
-}
-
-/// F11 in the gym window: flip it between maximized and fullscreen.
-#[tauri::command]
-fn toggle_gym_fullscreen(app: AppHandle) {
-    windows::toggle_gym_fullscreen(&app);
-}
-
-/// Honor-mode completion: camera path failed, the user attests the set.
-#[tauri::command]
-fn honor_complete(app: AppHandle) -> Result<Snapshot, String> {
-    hub::honor_complete(&app)
 }
 
 fn debug_exercise_options() -> Result<Vec<Prescription>, String> {
@@ -290,7 +252,6 @@ fn debug_exercise_options() -> Result<Vec<Prescription>, String> {
     }).collect())
 }
 
-#[tauri::command]
 fn debug_exercises(app: AppHandle) -> Result<Vec<Prescription>, String> {
     app.state::<Runtime>().require_debug()?;
     debug_exercise_options()
@@ -299,7 +260,6 @@ fn debug_exercises(app: AppHandle) -> Result<Vec<Prescription>, String> {
 /// DEBUG: force the session between "coding" and "workout" without waiting out
 /// the coding timer, and flip the camera to match. Lets you exercise live
 /// detection on demand from the debug toggle.
-#[tauri::command]
 fn debug_mode(app: AppHandle, state: State<SharedCore>, mode: String, exercise: Option<String>) -> Result<Snapshot, String> {
     app.state::<Runtime>().require_debug()?;
     if mode != "workout" && mode != "coding" { return Err("Unknown test action".into()); }
@@ -329,7 +289,6 @@ fn debug_mode(app: AppHandle, state: State<SharedCore>, mode: String, exercise: 
     Ok(snap)
 }
 
-#[tauri::command]
 fn simulate_progress(
     app: AppHandle,
     state: State<SharedCore>,
@@ -347,7 +306,6 @@ fn simulate_progress(
     Ok(snap)
 }
 
-#[tauri::command]
 fn confirm_weight(app: AppHandle, state: State<SharedCore>, weight: f64) -> Snapshot {
     let clock = SystemClock;
     let mut core = state.lock().unwrap();
@@ -448,7 +406,6 @@ fn list_debug_videos(vision_dir: &Path) -> Vec<DebugVideo> {
     out
 }
 
-#[tauri::command]
 fn debug_videos(app: AppHandle) -> Result<Vec<DebugVideo>, String> {
     app.state::<Runtime>().require_debug()?;
     if cfg!(debug_assertions) { return Ok(list_debug_videos(&vision_dir()?)); }
@@ -489,7 +446,6 @@ fn should_store_spawn(current_generation: u64, my_generation: u64) -> bool {
     current_generation == my_generation
 }
 
-#[tauri::command]
 fn debug_stream_start(
     app: AppHandle,
     state: State<SharedDebugProcess>,
@@ -638,12 +594,6 @@ fn debug_stream_start(
     Ok(())
 }
 
-#[tauri::command]
-fn debug_stream_stop(app: AppHandle) -> Result<(), String> {
-    stop_debug_process(&app);
-    Ok(())
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let _instance = match daily::instance_lock(&dirs_next_data_dir()) {
@@ -666,30 +616,9 @@ pub fn run() {
         .manage(Mutex::new(None) as hub::SharedHub)
         .invoke_handler(tauri::generate_handler![
             control::get_display_state,
-            daily::daily_status,
-            daily::recent_history,
-            daily::routine_settings,
-            daily::save_routine,
-            daily::share_workout,
-            daily::reminder_action,
             control::workout_action,
-            daily::save_daily_settings,
-            hub::get_camera_settings,
-            hub::save_camera_settings,
             get_snapshot,
-            get_app_mode,
-            set_app_mode,
-            show_gym,
-            emergency_escape,
-            simulate_progress,
-            confirm_weight,
-            honor_complete,
-            toggle_gym_fullscreen,
-            debug_mode,
-            debug_exercises,
-            debug_videos,
-            debug_stream_start,
-            debug_stream_stop
+            get_app_mode
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {

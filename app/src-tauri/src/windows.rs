@@ -127,18 +127,6 @@ fn gym_wants_fullscreen(app: &AppHandle) -> bool {
     setting(app, GYM_FULLSCREEN) != "0"
 }
 
-/// F11 in the gym window: flip fullscreen and remember it.
-pub(crate) fn toggle_gym_fullscreen(app: &AppHandle) {
-    if !app.state::<crate::Runtime>().enforces_windows() { return; }
-    let Some(gym) = app.get_webview_window("gym") else { return };
-    let on = !gym.is_fullscreen().unwrap_or(false);
-    remember(app, GYM_FULLSCREEN, if on { "1" } else { "0" });
-    let _ = gym.set_fullscreen(on);
-    if !on {
-        let _ = gym.maximize();
-    }
-}
-
 /// Once a second: whatever un-fullscreened the gym display (a workspace
 /// switch, a stray key), put it back — unless the user F11'd out on purpose.
 pub(crate) fn assert_gym(app: &AppHandle) {

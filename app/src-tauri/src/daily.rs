@@ -11,7 +11,6 @@ pub type SharedDaily = Mutex<Daily>;
 #[serde(rename_all="camelCase")]
 pub struct Status { workday_end:String, warn_minutes:u32, last_day_warning:String, checked_at: f64, agents: AgentPresence, snooze_until: f64, work_minutes: f64, lock_mode: bool, pub sync: String }
 
-#[tauri::command]
 pub fn daily_status(app: AppHandle) -> Status {
     let core = app.state::<SharedCore>(); let core = core.lock().unwrap();
     let daily = app.state::<SharedDaily>(); let daily = daily.lock().unwrap();
@@ -21,7 +20,6 @@ pub fn daily_status(app: AppHandle) -> Status {
         sync: core.store.setting("sync_status", "Not configured") }
 }
 
-#[tauri::command]
 pub fn reminder_action(app: AppHandle, action: String, minutes: Option<u32>) -> Result<(), String> {
     if app.state::<Runtime>().is_debug() { return Err("Switch to Workout mode first".into()); }
     let now = SystemClock.now();
@@ -53,7 +51,6 @@ pub fn reminder_action(app: AppHandle, action: String, minutes: Option<u32>) -> 
     Ok(())
 }
 
-#[tauri::command]
 pub fn save_daily_settings(app: AppHandle, minutes: u32, lock_mode: bool) -> Result<(), String> {
     if !(1..=240).contains(&minutes) { return Err("Interval must be 1–240 minutes".into()); }
     let state = app.state::<SharedCore>(); let mut core = state.lock().unwrap();
@@ -83,17 +80,10 @@ pub fn refresh(daily: &mut Daily) {
     daily.checked_at = SystemClock.now();
 }
 
-#[tauri::command]
-pub fn recent_history(state: tauri::State<SharedCore>) -> Result<serde_json::Value,String> {
-    let core=state.lock().unwrap();
-    Ok(serde_json::json!({"records":core.store.records(None,None,0,50,false).map_err(|e|e.to_string())?,"routine":crate::ROUTINE_JSON}))
-}
-#[tauri::command]
 pub fn routine_settings(app:AppHandle) -> Result<String,String> {
     let path=app.state::<Runtime>().session_home.join("routine.json");
     match std::fs::read_to_string(path){Ok(s)=>Ok(s),Err(e) if e.kind()==std::io::ErrorKind::NotFound=>Ok(crate::ROUTINE_JSON.into()),Err(e)=>Err(e.to_string())}
 }
-#[tauri::command]
 pub fn save_routine(app:AppHandle,json:String)->Result<(),String>{
     let state=app.state::<SharedCore>();let mut core=state.lock().unwrap();
     if core.session.snapshot(SystemClock.now()).phase!=Phase::Coding{return Err("Change routine between workouts".into());}
@@ -107,18 +97,6 @@ pub fn save_routine(app:AppHandle,json:String)->Result<(),String>{
     std::fs::rename(home.join("routine.json.tmp"),home.join("routine.json")).map_err(|e|e.to_string())?;
     core.session.set_plan(plan);Ok(())
 }
-#[tauri::command]
-pub fn share_workout(app:AppHandle,id:String)->Result<(),String>{
-    use tauri_plugin_opener::OpenerExt;
-    let home=&app.state::<Runtime>().normal_home;
-    let config=reps_cli::config(home,"upload.json")?;
-    let state=app.state::<SharedCore>();let core=state.lock().unwrap();
-    let record=core.store.records(None,None,0,100,false).map_err(|e|e.to_string())?.into_iter().find(|r|r.id==id).ok_or("Workout not found")?;
-    let mut url=reqwest_url(&config.url)?;
-    url.query_pairs_mut().append_pair("exercise",&record.exercise).append_pair("quantity",&if record.reps>0{record.reps.to_string()}else{record.seconds.to_string()}).append_pair("unit",if record.reps>0{"reps"}else{"seconds"});
-    app.opener().open_url(url.as_str(),None::<&str>).map_err(|e|e.to_string())
-}
-fn reqwest_url(s:&str)->Result<url::Url,String>{url::Url::parse(s).map_err(|e|e.to_string())}
 
 #[cfg(test)] mod tests {
  use super::*;
