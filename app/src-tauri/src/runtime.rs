@@ -1,6 +1,6 @@
 //! Startup policy, separate from workout phases. Debug never shares workout data.
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -13,7 +13,6 @@ pub struct Runtime {
     pub session_home: PathBuf,
     pub stopping: AtomicBool,
     pub lock_mode: AtomicBool,
-    pub detector_generation: AtomicU64,
 }
 
 impl Runtime {
@@ -32,7 +31,7 @@ impl Runtime {
             }
             path
         } else { normal_home.clone() };
-        Ok(Self {mode, normal_home, session_home, stopping: AtomicBool::new(false), lock_mode: AtomicBool::new(false), detector_generation: AtomicU64::new(0)})
+        Ok(Self {mode, normal_home, session_home, stopping: AtomicBool::new(false), lock_mode: AtomicBool::new(false)})
     }
 
     pub fn is_debug(&self) -> bool { self.mode == AppMode::Debug }

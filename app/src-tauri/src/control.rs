@@ -21,7 +21,7 @@ fn view(app:&AppHandle,name:&str,preview:bool){
  let state={let state=app.state::<SharedDisplay>();let mut s=state.lock().unwrap();s.view=name.into();s.preview_only=preview;s.last_error=None;s.frames_seen=0;s.clone()};
  let _=app.emit("display-state",state);
 }
-fn stop_preview(app:&AppHandle){if preview_only(app){crate::hub::disable_metric_now(app);}view(app,"screen",false);}
+fn stop_preview(app:&AppHandle){if preview_only(app){app.state::<Lifecycle>().release_camera();}view(app,"screen",false);}
 fn show(app:&AppHandle){if let Some(w)=app.get_webview_window("main"){let _=w.show();let _=w.unminimize();}}
 fn dispatch(app:&AppHandle, command:Command)->Result<serde_json::Value,String>{
  command.validate()?;
@@ -63,13 +63,13 @@ fn dispatch(app:&AppHandle, command:Command)->Result<serde_json::Value,String>{
      if !matches!(phase,Phase::Coding|Phase::WorkoutActive){return Err("Finish, skip, or cancel the current break before starting camera preview".into());}
      let preview=phase==Phase::Coding;
      view(app,"camera",preview);show(app);
-     if preview{crate::hub::enable_metric_async(app,"squat".into(),100000,0.);}
+     if preview{app.state::<Lifecycle>().enable("squat".into(),100000,0.);}
     },
     "stop"=>stop_preview(app),
     "status"=>{
      let state=app.state::<crate::hub::SharedHub>();let mut hub=state.lock().unwrap();
      // No hub to ask: say why vision is unavailable rather than "starting" forever.
-     let health=hub.as_mut().ok_or_else(||match app.state::<crate::hub::SharedVision>().lock().unwrap().status(){crate::vision_status::VisionStatus::Unavailable{reason}=>reason,_=>"Vision hub is starting".into()})?.health().map_err(|e|e.to_string())?;
+     let health=hub.as_mut().ok_or_else(||match app.state::<Lifecycle>().vision_status(){crate::vision_status::VisionStatus::Unavailable{reason}=>reason,_=>"Vision hub is starting".into()})?.health().map_err(|e|e.to_string())?;
      return Ok(serde_json::json!({"visionHost":health.vision_host,"camera":health.camera,"enabledMetrics":health.enabled_metrics,"display":get_display_state(app.clone())}));
     },_=>unreachable!()
    }

@@ -31,11 +31,11 @@ pub fn reminder_action(app: AppHandle, action: String, minutes: Option<u32>) -> 
             return Err(if phase == Phase::Coding { "Today's routine is complete; nothing to start" } else { "A workout is already in progress" }.into());
         }
         // Before the detector is enabled: the enable path reads the session id.
-        crate::hub::publish_facts(&facts);
+        life.publish_facts(&facts);
         core.store.set_setting("snooze_until", "0").map_err(|e| e.to_string())?;
         app.state::<SharedDaily>().lock().unwrap().snooze_until = 0.;
         let snap = life.persist(&mut core); drop(core);
-        crate::enable_metric_for(&app, &snap); life.emit(&snap);
+        crate::enable_metric_for(&life, &snap); life.emit(&snap);
     } else if action == "snooze" || action == "skip" {
         if !matches!(phase, Phase::Coding | Phase::ExerciseRequired) { return Err("Finish or stop the current workout first".into()); }
         let until = if action == "snooze" {
@@ -44,12 +44,12 @@ pub fn reminder_action(app: AppHandle, action: String, minutes: Option<u32>) -> 
         } else { 0. };
         core.store.set_setting("snooze_until", &until.to_string()).map_err(|e| e.to_string())?;
         app.state::<SharedDaily>().lock().unwrap().snooze_until = until;
-        crate::hub::publish_facts(&core.session.release(if action == "snooze" { Release::Snooze } else { Release::Skip }, now));
+        life.publish_facts(&core.session.release(if action == "snooze" { Release::Snooze } else { Release::Skip }, now));
         // Snooze means remind at expiry, rather than expiry plus a full interval.
         if until > 0. { core.session.configure_timer(0., now); }
         else { let interval = core.store.setting("work_minutes", "25").parse().unwrap_or(25.); core.session.configure_timer(interval, now); }
         let snap = life.persist(&mut core); drop(core);
-        crate::hub::disable_metric_async(&app); crate::windows::release(&app); life.emit(&snap);
+        life.disable(); crate::windows::release(&app); life.emit(&snap);
     } else { return Err("Unknown reminder action".into()); }
     Ok(())
 }

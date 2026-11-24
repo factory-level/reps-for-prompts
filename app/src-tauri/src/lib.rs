@@ -167,13 +167,20 @@ impl lifecycle::Effects for TauriEffects {
         windows::apply_lock(app, snap.phase != Phase::Coding);
         let _ = app.emit("snapshot", snap);
     }
+    fn vision(&self, status: vision_status::VisionStatus) { control::vision(&self.0, status); }
+    fn camera_frame(&self, camera_id: &str, data: &serde_json::Value) {
+        if control::camera_frame(&self.0) {
+            let _ = self.0.emit_to("main", "vision-camera", serde_json::json!({"cameraId": camera_id, "data": data}));
+        }
+    }
+    fn publish(&self, publication: hub_client::outbox::Publication) { hub::queue(publication); }
 }
 
 /// Camera on only while working out: enable the metric for the prescription
 /// (fire-and-forget; failure surfaces honor mode).
-fn enable_metric_for(app: &AppHandle, snap: &Snapshot) {
+fn enable_metric_for(life: &Lifecycle, snap: &Snapshot) {
     if let Some(rx) = snap.prescription.as_ref() {
-        hub::enable_metric_async(app, rx.exercise.clone(), rx.target_reps, rx.target_seconds);
+        life.enable(rx.exercise.clone(), rx.target_reps, rx.target_seconds);
     }
 }
 
@@ -200,14 +207,14 @@ fn shutdown_runtime(app: &AppHandle) {
 }
 
 /// Emergency escape remains available in enforced Workout mode.
-fn emergency_escape(app: AppHandle, state: State<Lifecycle>) -> Snapshot {
+fn emergency_escape(_app: AppHandle, state: State<Lifecycle>) -> Snapshot {
     let mut core = state.core();
-    hub::publish_facts(&core.session.release(Release::Cancel, SystemClock.now()));
+    state.publish_facts(&core.session.release(Release::Cancel, SystemClock.now()));
     let minutes = core.store.setting("work_minutes", "25").parse().unwrap_or(25.);
     core.session.configure_timer(minutes, SystemClock.now());
     let snap = state.persist(&mut core);
     drop(core);
-    hub::disable_metric_async(&app);
+    state.disable();
     state.emit(&snap);
     snap
 }
@@ -228,7 +235,7 @@ fn debug_mode(app: AppHandle, state: State<Lifecycle>, mode: String, exercise: O
             .ok_or_else(|| format!("Unknown exercise: {name}"))).transpose()?
     } else { None };
     stop_debug_process(&app);
-    hub::disable_metric_now(&app);
+    state.release_camera();
     let clock = SystemClock;
     let mut core = state.core();
     let workout = mode == "workout";
@@ -236,18 +243,18 @@ fn debug_mode(app: AppHandle, state: State<Lifecycle>, mode: String, exercise: O
         if let Some(rx) = selected { core.session.debug_start_exercise(rx); }
         else {
             // Restart from any phase: drop the current set, then take the next.
-            hub::publish_facts(&core.session.release(Release::Cancel, clock.now()));
-            hub::publish_facts(&core.session.start_workout(&clock.today()));
+            state.publish_facts(&core.session.release(Release::Cancel, clock.now()));
+            state.publish_facts(&core.session.start_workout(&clock.today()));
         }
     } else {
-        hub::publish_facts(&core.session.release(Release::Cancel, clock.now()));
+        state.publish_facts(&core.session.release(Release::Cancel, clock.now()));
     }
     let snap = state.persist(&mut core);
     drop(core);
     if workout {
-        enable_metric_for(&app, &snap);
+        enable_metric_for(&state, &snap);
     } else {
-        hub::disable_metric_async(&app);
+        state.disable();
     }
     state.emit(&snap);
     Ok(snap)
@@ -262,26 +269,26 @@ fn simulate_progress(
     app.state::<Runtime>().require_debug()?;
     let mut core = state.core();
     let unit = "reps".to_string();
-    hub::publish_facts(&core.session.report_progress(Progress { value, unit, satisfied }));
+    state.publish_facts(&core.session.report_progress(Progress { value, unit, satisfied }));
     let snap = state.persist(&mut core);
     drop(core);
-    if satisfied { hub::disable_metric_async(&app); }
+    if satisfied { state.disable(); }
     state.emit(&snap);
     Ok(snap)
 }
 
-fn confirm_weight(app: AppHandle, state: State<Lifecycle>, weight: f64) -> Snapshot {
+fn confirm_weight(_app: AppHandle, state: State<Lifecycle>, weight: f64) -> Snapshot {
     let clock = SystemClock;
     let mut core = state.core();
     // persist_and_snapshot writes the pending record.
-    hub::publish_facts(&core.session.confirm_weight(weight, &clock.today()));
+    state.publish_facts(&core.session.confirm_weight(weight, &clock.today()));
     let snap = state.persist(&mut core);
     drop(core);
     // Camera gating: confirming the weight ENDS the workout, so it must
     // release the camera like every other completion path. Found live: a
     // simulated/early completion left the detector running (and counting)
     // after desktop_unlocked because only the hub-satisfied path disabled.
-    hub::disable_metric_async(&app);
+    state.disable();
     state.emit(&snap);
     snap
 }
@@ -425,7 +432,7 @@ fn debug_stream_start(
     });
     let python = environment.join(if cfg!(windows) { "Scripts/python.exe" } else { "bin/python" });
     if !python.is_file() { return Err("Vision environment is not ready; wait for startup and try again".into()); }
-    hub::disable_metric_now(&app);
+    app.state::<Lifecycle>().release_camera();
     let my_generation = {
         let mut guard = state.lock().unwrap();
         if let Some(child) = guard.child.as_mut() {
@@ -566,8 +573,7 @@ pub fn run() {
             generation: 0,
             child: None,
         }) as SharedDebugProcess)
-        .manage(Mutex::new(None) as hub::SharedHub)
-        .manage(hub::SharedVision::default())
+        .manage(hub::SharedHub::default())
         .invoke_handler(tauri::generate_handler![
             control::get_display_state,
             control::workout_action,
@@ -587,7 +593,13 @@ pub fn run() {
             }
         })
         .setup(move |app| {
-            app.manage(Lifecycle::new(core, Box::new(SystemClock), Box::new(TauriEffects(app.handle().clone()))));
+            let home = app.state::<Runtime>().normal_home.clone();
+            app.manage(Lifecycle::new(
+                core, Box::new(SystemClock), hub::SharedHub::clone(&app.state()),
+                Box::new(TauriEffects(app.handle().clone())),
+                Box::new(move || detector::load_inputs(&home)),
+                app.state::<Runtime>().is_debug(), false,
+            ));
             control::start(app.handle()).map_err(std::io::Error::other)?;
             if !app.state::<Runtime>().is_debug() {
                 let home = dirs_next_data_dir(); let handle = app.handle().clone();
@@ -612,7 +624,7 @@ pub fn run() {
                 let clock = SystemClock;
                 let state = handle.state::<Lifecycle>();
                 if !handle.state::<Runtime>().is_debug() {
-                    hub::publish_facts(&state.core().session.start(clock.now(), &clock.today()));
+                    state.publish_facts(&state.core().session.start(clock.now(), &clock.today()));
                 }
             }
             std::thread::spawn(move || {
@@ -662,16 +674,16 @@ pub fn run() {
                     }
                     let locked = if !handle.state::<Runtime>().is_debug() && can_remind { core.session.tick(now, &today) } else { vec![] };
                     let locked_now = !locked.is_empty();
-                    hub::publish_facts(&locked);
+                    state.publish_facts(&locked);
                     let mut snap = core.session.snapshot(now);
                     if locked_now {
                         // Show the passive reminder; CLI starts the camera.
                         if !warn {daily::notify("Time for a little movement. Start your next workout from the terminal: rfp start".into());}
                         state.emit(&snap);
                         if handle.state::<Runtime>().enforces_windows() {
-                            hub::publish_facts(&core.session.start_workout(&today));
+                            state.publish_facts(&core.session.start_workout(&today));
                             snap = state.persist(&mut core);
-                            enable_metric_for(&handle, &snap);
+                            enable_metric_for(&state, &snap);
                         } else if let Some(window) = handle.get_webview_window("main") {
                             let _ = window.show(); let _ = window.unminimize();
                         }
@@ -680,13 +692,13 @@ pub fn run() {
                     if !handle.state::<Runtime>().is_debug() && snap.phase == Phase::Unlocked {
                         let since = *unlocked_since.get_or_insert(now);
                         if now - since >= 3.0 {
-                            hub::publish_facts(&core.session.resume_coding(now));
+                            state.publish_facts(&core.session.resume_coding(now));
                             let minutes = core.store.setting("work_minutes", "25").parse().unwrap_or(25.);
                             core.session.configure_timer(minutes, now);
                             snap = state.persist(&mut core);
                             unlocked_since = None;
                             // Belt and braces: an aborted workout must release the camera.
-                            hub::disable_metric_async(&handle);
+                            state.disable();
                         }
                     } else {
                         unlocked_since = None;
