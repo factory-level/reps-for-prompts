@@ -24,6 +24,12 @@ impl CodingTimer {
         self.start(now);
     }
 
+    /// Run for `secs` from `now` without changing the configured interval
+    /// (resuming a paused countdown).
+    pub fn start_for(&mut self, now: f64, secs: f64) {
+        self.deadline = Some(now + secs.max(0.0));
+    }
+
     pub fn stop(&mut self) {
         self.deadline = None;
     }

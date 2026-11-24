@@ -29,6 +29,16 @@ CREATE TABLE IF NOT EXISTS pointer_state (
     capacity_used INTEGER NOT NULL,
     capacity_date TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS workouts (
+    id TEXT PRIMARY KEY,
+    routine_id TEXT NOT NULL,
+    routine_name TEXT NOT NULL,
+    slot_id TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('active','completed','partial','canceled')),
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    local_date TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS exercise_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     date TEXT NOT NULL,
@@ -76,6 +86,11 @@ impl Store {
                     UPDATE exercise_history SET public_id=lower(hex(randomblob(16)));
                     CREATE UNIQUE INDEX history_public_id ON exercise_history(public_id);
                     UPDATE schema_version SET version=2;")?;
+            }
+            let has_workout: bool = conn.query_row("SELECT count(*) FROM pragma_table_info('exercise_history') WHERE name='workout_id'", [], |r| r.get::<_, i64>(0)).map(|n| n > 0)?;
+            if !has_workout {
+                conn.execute_batch("ALTER TABLE exercise_history ADD COLUMN workout_id TEXT;
+                    UPDATE schema_version SET version=3;")?;
             }
             Ok(())
         })();
@@ -208,6 +223,61 @@ impl Store {
         Ok(())
     }
 
+    /// Attach the set just recorded to its workout session.
+    pub fn tag_last_set(&self, workout_id: &str) -> rusqlite::Result<()> {
+        self.conn.execute("UPDATE exercise_history SET workout_id=?1 WHERE id=last_insert_rowid()", [workout_id])?;
+        Ok(())
+    }
+
+    pub fn insert_workout(&self, id: &str, routine_id: &str, routine_name: &str, slot_id: &str, local_date: &str) -> rusqlite::Result<()> {
+        self.conn.execute("INSERT INTO workouts(id,routine_id,routine_name,slot_id,status,started_at,local_date) VALUES(?1,?2,?3,?4,'active',strftime('%Y-%m-%dT%H:%M:%fZ','now'),?5)",
+            params![id, routine_id, routine_name, slot_id, local_date])?;
+        Ok(())
+    }
+
+    /// Close a session. `local_date` is the completion date (where a full
+    /// routine counts); only an active session can be closed.
+    pub fn finish_workout(&self, id: &str, status: &str, local_date: &str) -> rusqlite::Result<bool> {
+        let n = self.conn.execute("UPDATE workouts SET status=?2, completed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'), local_date=?3 WHERE id=?1 AND status='active'",
+            params![id, status, local_date])?;
+        Ok(n == 1)
+    }
+
+    /// Sessions whose local date is in [from, to], oldest first.
+    pub fn workouts_between(&self, from: &str, to: &str) -> rusqlite::Result<Vec<serde_json::Value>> {
+        let mut q = self.conn.prepare("SELECT w.id,w.routine_name,w.status,w.started_at,w.completed_at,w.local_date,
+            (SELECT count(*) FROM exercise_history h WHERE h.workout_id=w.id) FROM workouts w WHERE w.local_date BETWEEN ?1 AND ?2 ORDER BY w.started_at")?;
+        let rows = q.query_map(params![from, to], |r| Ok(serde_json::json!({
+            "id": r.get::<_, String>(0)?, "routine": r.get::<_, String>(1)?, "status": r.get::<_, String>(2)?,
+            "startedAt": r.get::<_, String>(3)?, "completedAt": r.get::<_, Option<String>>(4)?, "date": r.get::<_, String>(5)?,
+            "sets": r.get::<_, i64>(6)?,
+        })))?.collect();
+        rows
+    }
+
+    /// Confirmed sets in [from, to] (or of one exercise), oldest first.
+    pub fn sets(&self, from: Option<&str>, to: Option<&str>, exercise: Option<&str>) -> rusqlite::Result<Vec<serde_json::Value>> {
+        let mut q = self.conn.prepare("SELECT id,date,exercise,kind,reps,seconds,weight,verified,workout_id,recorded_at FROM exercise_history
+            WHERE (?1 IS NULL OR date>=?1) AND (?2 IS NULL OR date<=?2) AND (?3 IS NULL OR exercise=?3) ORDER BY id")?;
+        let rows = q.query_map(params![from, to, exercise], |r| Ok(serde_json::json!({
+            "id": r.get::<_, i64>(0)?, "date": r.get::<_, String>(1)?, "exercise": r.get::<_, String>(2)?,
+            "kind": r.get::<_, String>(3)?, "reps": r.get::<_, i64>(4)?, "seconds": r.get::<_, f64>(5)?,
+            "weight": r.get::<_, f64>(6)?, "verified": r.get::<_, i64>(7)? != 0,
+            "workoutId": r.get::<_, Option<String>>(8)?, "recordedAt": r.get::<_, Option<String>>(9)?,
+        })))?.collect();
+        rows
+    }
+
+    /// The weight of the last confirmed set of this exercise, if any.
+    pub fn last_weight(&self, exercise: &str) -> Option<f64> {
+        self.conn.query_row("SELECT weight FROM exercise_history WHERE exercise=?1 AND kind='rep' ORDER BY id DESC LIMIT 1", [exercise], |r| r.get(0)).ok()
+    }
+
+    /// Whether a session was started on this local date.
+    pub fn started_on(&self, local_date: &str) -> bool {
+        self.conn.query_row("SELECT count(*) FROM workouts WHERE local_date=?1", [local_date], |r| r.get::<_, i64>(0)).map(|n| n > 0).unwrap_or(false)
+    }
+
     pub fn history(&self, limit: u32) -> rusqlite::Result<Vec<SetRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT date, exercise, kind, reps, seconds, weight, verified
@@ -277,6 +347,30 @@ pub fn default_continuous_pool() -> Vec<ExerciseDef> {
             target_seconds: 30.0,
         },
     ]
+}
+
+#[cfg(test)]
+mod workout_tests {
+    use super::*;
+    #[test]
+    fn workouts_close_once_and_sets_join_them() {
+        let path = std::env::temp_dir().join(format!("rfp-store-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let s = Store::open(&path).unwrap();
+        s.insert_workout("w1", "upper-a", "Upper A", "slot1", "2026-11-23").unwrap();
+        assert!(s.started_on("2026-11-23"));
+        s.record_set(&SetRecord { date: "2026-11-23".into(), exercise: "overhead".into(), kind: ExerciseKind::Rep, reps: 12, seconds: 0., weight: 35.0, verified: false }).unwrap();
+        s.tag_last_set("w1").unwrap();
+        s.record_set(&SetRecord { date: "2026-11-24".into(), exercise: "overhead".into(), kind: ExerciseKind::Rep, reps: 10, seconds: 0., weight: 40.0, verified: true }).unwrap();
+        s.tag_last_set("w1").unwrap();
+        assert_eq!(s.last_weight("overhead"), Some(40.0));
+        assert!(s.finish_workout("w1", "completed", "2026-11-24").unwrap());
+        assert!(!s.finish_workout("w1", "partial", "2026-11-24").unwrap()); // exactly once
+        let w = s.workouts_between("2026-11-23", "2026-11-29").unwrap();
+        assert_eq!((w[0]["status"].as_str(), w[0]["sets"].as_i64(), w[0]["date"].as_str()), (Some("completed"), Some(2), Some("2026-11-24")));
+        assert_eq!(s.sets(None, None, Some("overhead")).unwrap().len(), 2);
+        drop(s); let _ = std::fs::remove_file(&path);
+    }
 }
 
 #[cfg(test)]

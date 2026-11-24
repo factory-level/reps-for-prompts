@@ -185,6 +185,7 @@ pub(crate) fn wire_events(fact: &Fact) -> Vec<(&'static str, serde_json::Value)>
             vec![("weight_logged", json!({"exercise": exercise, "weight": weight}))]
         }
         Fact::Completed => vec![("workout_completed", json!({})), ("desktop_unlocked", json!({}))],
+        Fact::RoutineCompleted => vec![("routine_completed", json!({}))],
         Fact::Released(why) => {
             let reason = match why { Release::Cancel => "cancel", Release::Snooze => "snooze", Release::Skip => "skip" };
             vec![("desktop_unlocked", json!({"reason": reason}))]

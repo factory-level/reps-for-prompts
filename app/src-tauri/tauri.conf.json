@@ -14,21 +14,35 @@
       {
         "label": "main",
         "title": "RFP: reps for prompts",
-        "width": 1280,
-        "height": 720,
+        "width": 960,
+        "height": 680,
+        "minWidth": 560,
+        "minHeight": 480,
         "visible": false,
-        "focus": false,
-        "decorations": false
+        "center": true
       },
       {
         "label": "gym",
-        "title": "RFP \u2014 Workout",
+        "title": "RFP — Workout",
         "width": 960,
         "height": 540,
         "url": "index.html?window=gym",
         "visible": false,
         "focus": false,
         "decorations": false
+      },
+      {
+        "label": "prompt",
+        "title": "RFP — Time to move",
+        "width": 500,
+        "height": 400,
+        "url": "index.html?window=prompt",
+        "visible": false,
+        "focus": false,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "resizable": false
       }
     ],
     "security": {
