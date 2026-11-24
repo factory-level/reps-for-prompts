@@ -30,18 +30,20 @@ fn load_daily_plan(dir: &Path, today: &str) -> Result<DailyPlan, String> {
 
 /// Persisted per-item completion so the day survives app restarts.
 #[derive(Serialize, Deserialize, Default)]
-struct PlanState {
-    date: String,
-    done: Vec<(String, u32)>,
+pub(crate) struct PlanState {
+    pub(crate) date: String,
+    pub(crate) done: Vec<(String, u32)>,
 }
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
 
 mod detector;
 mod hub;
+mod lifecycle;
 mod vision_status;
 mod windows;
 mod runtime;
 mod daily;
+use lifecycle::Lifecycle;
 use runtime::{AppMode, Runtime};
 
 /// Installer diagnostic: use the same Tauri resource lookup and supervisor as
@@ -78,8 +80,6 @@ pub(crate) struct Core {
     pub(crate) session: Session,
     pub(crate) store: Store,
 }
-
-pub(crate) type SharedCore = Mutex<Core>;
 
 fn build_core(dir: &Path) -> Core {
     let store = Store::open(&dir.join("reps.sqlite")).expect("open sqlite");
@@ -118,36 +118,6 @@ fn build_core(dir: &Path) -> Core {
 
 fn dirs_next_data_dir() -> std::path::PathBuf { engine::activity::app_home() }
 
-pub(crate) fn persist_and_snapshot(core: &mut Core) -> Snapshot {
-    let clock = SystemClock;
-    if let Some(rec) = core.session.take_pending_record() {
-        match core.store.record_set(&rec) {
-            Ok(()) => {}
-            Err(e) => eprintln!("failed to record set: {e}"),
-        }
-    }
-    let w = core.session.workout();
-    match core
-        .store
-        .save_pointer_state(w.pointer(), w.capacity_used(), w.capacity_date())
-    {
-        Ok(()) => {}
-        Err(e) => eprintln!("failed to save pointer state: {e}"),
-    }
-    // Persist the daily-plan completion so today's progress survives a restart.
-    if let Some(plan) = core.session.plan() {
-        let day=plan.to_day_plan();
-        if let Err(error)=core.store.record_routine_day(plan.date(),day.sets_done,day.sets_total){eprintln!("Could not save routine progress: {error}");}
-        let ps = PlanState { date: plan.date().to_string(), done: plan.done_state() };
-        if let Ok(json) = serde_json::to_string(&ps) {
-            if let Err(e) = core.store.set_setting("plan_state", &json) {
-                eprintln!("failed to save plan state: {e}");
-            }
-        }
-    }
-    core.session.snapshot(clock.now())
-}
-
 /// Print a concise, human-readable line of the current session state to the
 /// terminal (stdout) whenever it changes — so you can read your state while the
 /// app runs without watching the webview.
@@ -185,12 +155,18 @@ pub(crate) fn print_state(snap: &Snapshot) {
     }
 }
 
-pub(crate) fn emit_snapshot(app: &AppHandle, snap: &Snapshot) {
-    if app.state::<Runtime>().is_stopping() { return; }
-    print_state(snap);
-    // Debt owed → the programming monitor is locked (fullscreen, on top).
-    windows::apply_lock(app, snap.phase != Phase::Coding);
-    let _ = app.emit("snapshot", snap);
+/// The desktop adapter of the lifecycle's `Effects` seam.
+struct TauriEffects(AppHandle);
+
+impl lifecycle::Effects for TauriEffects {
+    fn snapshot(&self, snap: &Snapshot) {
+        let app = &self.0;
+        if app.state::<Runtime>().is_stopping() { return; }
+        print_state(snap);
+        // Debt owed → the programming monitor is locked (fullscreen, on top).
+        windows::apply_lock(app, snap.phase != Phase::Coding);
+        let _ = app.emit("snapshot", snap);
+    }
 }
 
 /// Camera on only while working out: enable the metric for the prescription
@@ -202,9 +178,8 @@ fn enable_metric_for(app: &AppHandle, snap: &Snapshot) {
 }
 
 #[tauri::command]
-fn get_snapshot(state: State<SharedCore>) -> Snapshot {
-    let mut core = state.lock().unwrap();
-    persist_and_snapshot(&mut core)
+fn get_snapshot(state: State<Lifecycle>) -> Snapshot {
+    state.snapshot()
 }
 
 #[tauri::command]
@@ -225,15 +200,15 @@ fn shutdown_runtime(app: &AppHandle) {
 }
 
 /// Emergency escape remains available in enforced Workout mode.
-fn emergency_escape(app: AppHandle, state: State<SharedCore>) -> Snapshot {
-    let mut core = state.lock().unwrap();
+fn emergency_escape(app: AppHandle, state: State<Lifecycle>) -> Snapshot {
+    let mut core = state.core();
     hub::publish_facts(&core.session.release(Release::Cancel, SystemClock.now()));
     let minutes = core.store.setting("work_minutes", "25").parse().unwrap_or(25.);
     core.session.configure_timer(minutes, SystemClock.now());
-    let snap = persist_and_snapshot(&mut core);
+    let snap = state.persist(&mut core);
     drop(core);
     hub::disable_metric_async(&app);
-    emit_snapshot(&app, &snap);
+    state.emit(&snap);
     snap
 }
 
@@ -245,7 +220,7 @@ fn debug_exercises(app: AppHandle) -> Result<Vec<Prescription>, String> {
 /// DEBUG: force the session between "coding" and "workout" without waiting out
 /// the coding timer, and flip the camera to match. Lets you exercise live
 /// detection on demand from the debug toggle.
-fn debug_mode(app: AppHandle, state: State<SharedCore>, mode: String, exercise: Option<String>) -> Result<Snapshot, String> {
+fn debug_mode(app: AppHandle, state: State<Lifecycle>, mode: String, exercise: Option<String>) -> Result<Snapshot, String> {
     app.state::<Runtime>().require_debug()?;
     if mode != "workout" && mode != "coding" { return Err("Unknown test action".into()); }
     let selected = if mode == "workout" {
@@ -255,7 +230,7 @@ fn debug_mode(app: AppHandle, state: State<SharedCore>, mode: String, exercise: 
     stop_debug_process(&app);
     hub::disable_metric_now(&app);
     let clock = SystemClock;
-    let mut core = state.lock().unwrap();
+    let mut core = state.core();
     let workout = mode == "workout";
     if workout {
         if let Some(rx) = selected { core.session.debug_start_exercise(rx); }
@@ -267,47 +242,47 @@ fn debug_mode(app: AppHandle, state: State<SharedCore>, mode: String, exercise: 
     } else {
         hub::publish_facts(&core.session.release(Release::Cancel, clock.now()));
     }
-    let snap = persist_and_snapshot(&mut core);
+    let snap = state.persist(&mut core);
     drop(core);
     if workout {
         enable_metric_for(&app, &snap);
     } else {
         hub::disable_metric_async(&app);
     }
-    emit_snapshot(&app, &snap);
+    state.emit(&snap);
     Ok(snap)
 }
 
 fn simulate_progress(
     app: AppHandle,
-    state: State<SharedCore>,
+    state: State<Lifecycle>,
     value: f64,
     satisfied: bool,
 ) -> Result<Snapshot, String> {
     app.state::<Runtime>().require_debug()?;
-    let mut core = state.lock().unwrap();
+    let mut core = state.core();
     let unit = "reps".to_string();
     hub::publish_facts(&core.session.report_progress(Progress { value, unit, satisfied }));
-    let snap = persist_and_snapshot(&mut core);
+    let snap = state.persist(&mut core);
     drop(core);
     if satisfied { hub::disable_metric_async(&app); }
-    emit_snapshot(&app, &snap);
+    state.emit(&snap);
     Ok(snap)
 }
 
-fn confirm_weight(app: AppHandle, state: State<SharedCore>, weight: f64) -> Snapshot {
+fn confirm_weight(app: AppHandle, state: State<Lifecycle>, weight: f64) -> Snapshot {
     let clock = SystemClock;
-    let mut core = state.lock().unwrap();
+    let mut core = state.core();
     // persist_and_snapshot writes the pending record.
     hub::publish_facts(&core.session.confirm_weight(weight, &clock.today()));
-    let snap = persist_and_snapshot(&mut core);
+    let snap = state.persist(&mut core);
     drop(core);
     // Camera gating: confirming the weight ENDS the workout, so it must
     // release the camera like every other completion path. Found live: a
     // simulated/early completion left the detector running (and counting)
     // after desktop_unlocked because only the hub-satisfied path disabled.
     hub::disable_metric_async(&app);
-    emit_snapshot(&app, &snap);
+    state.emit(&snap);
     snap
 }
 
@@ -395,7 +370,7 @@ fn debug_videos(app: AppHandle) -> Result<Vec<DebugVideo>, String> {
 }
 
 /// Managed state for the currently-running debug sidecar child, kept
-/// separate from `SharedCore` since it guards an OS process handle rather
+/// separate from the `Lifecycle` since it guards an OS process handle rather
 /// than app/session data. `generation` disambiguates a reader thread's own
 /// (possibly stale) child from one belonging to a newer `debug_stream_start`
 /// call, so a slow-to-exit old process can never be reaped/waited-on twice
@@ -587,7 +562,6 @@ pub fn run() {
         .manage(Mutex::new(control::DisplayState::default()))
         .manage(Mutex::new(daily::Daily { agents: Default::default(), snooze_until, checked_at: 0. }))
         .manage(runtime)
-        .manage(Mutex::new(core) as SharedCore)
         .manage(Mutex::new(DebugProcess {
             generation: 0,
             child: None,
@@ -612,8 +586,8 @@ pub fn run() {
                 }
             }
         })
-        .setup(|app| {
-
+        .setup(move |app| {
+            app.manage(Lifecycle::new(core, Box::new(SystemClock), Box::new(TauriEffects(app.handle().clone()))));
             control::start(app.handle()).map_err(std::io::Error::other)?;
             if !app.state::<Runtime>().is_debug() {
                 let home = dirs_next_data_dir(); let handle = app.handle().clone();
@@ -622,8 +596,7 @@ pub fn run() {
                     while !handle.state::<Runtime>().is_stopping() {
                         if home.join("upload.json").exists() || home.join("sites.json").exists() {
                             if let Err(error) = reps_cli::sync(&home) {
-                                let state = handle.state::<SharedCore>();
-                                let _ = state.lock().unwrap().store.set_setting("sync_status", &error);
+                                let _ = handle.state::<Lifecycle>().core().store.set_setting("sync_status", &error);
                                 delay = (delay * 2).min(3600);
                             } else { delay = 300; }
                         }
@@ -637,9 +610,9 @@ pub fn run() {
             // The coding timer starts the moment the app does — no "start" button.
             {
                 let clock = SystemClock;
-                let state = handle.state::<SharedCore>();
+                let state = handle.state::<Lifecycle>();
                 if !handle.state::<Runtime>().is_debug() {
-                    hub::publish_facts(&state.lock().unwrap().session.start(clock.now(), &clock.today()));
+                    hub::publish_facts(&state.core().session.start(clock.now(), &clock.today()));
                 }
             }
             std::thread::spawn(move || {
@@ -650,8 +623,8 @@ pub fn run() {
                     std::thread::sleep(Duration::from_secs(1));
                     let clock = SystemClock;
                     let (now, today) = (clock.now(), clock.today());
-                    let state = handle.state::<SharedCore>();
-                    let mut core = state.lock().unwrap();
+                    let state = handle.state::<Lifecycle>();
+                    let mut core = state.core();
                     if handle.state::<Runtime>().is_stopping() { break; }
                     let daily_state = handle.state::<daily::SharedDaily>();
                     let mut daily = daily_state.lock().unwrap();
@@ -694,10 +667,10 @@ pub fn run() {
                     if locked_now {
                         // Show the passive reminder; CLI starts the camera.
                         if !warn {daily::notify("Time for a little movement. Start your next workout from the terminal: rfp start".into());}
-                        emit_snapshot(&handle, &snap);
+                        state.emit(&snap);
                         if handle.state::<Runtime>().enforces_windows() {
                             hub::publish_facts(&core.session.start_workout(&today));
-                            snap = persist_and_snapshot(&mut core);
+                            snap = state.persist(&mut core);
                             enable_metric_for(&handle, &snap);
                         } else if let Some(window) = handle.get_webview_window("main") {
                             let _ = window.show(); let _ = window.unminimize();
@@ -710,7 +683,7 @@ pub fn run() {
                             hub::publish_facts(&core.session.resume_coding(now));
                             let minutes = core.store.setting("work_minutes", "25").parse().unwrap_or(25.);
                             core.session.configure_timer(minutes, now);
-                            snap = persist_and_snapshot(&mut core);
+                            snap = state.persist(&mut core);
                             unlocked_since = None;
                             // Belt and braces: an aborted workout must release the camera.
                             hub::disable_metric_async(&handle);
@@ -723,7 +696,7 @@ pub fn run() {
                     let status_home = &handle.state::<Runtime>().session_home;
                     if poll_due && std::fs::write(status_home.join("status.json.tmp"), runtime_status.to_string()).is_ok() { let _ = std::fs::rename(status_home.join("status.json.tmp"), status_home.join("status.json")); }
                     drop(core);
-                    emit_snapshot(&handle, &snap);
+                    state.emit(&snap);
                     windows::refocus(&handle);
                     windows::assert_gym(&handle);
                 }

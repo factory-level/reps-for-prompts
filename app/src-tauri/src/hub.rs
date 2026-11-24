@@ -421,12 +421,12 @@ fn pump_events(app: AppHandle, rx: std::sync::mpsc::Receiver<VisionEvent>) {
                 let disconnected = context.camera_status.as_deref() == Some("disconnected")
                     || context.consensus.as_ref().is_some_and(|c| c["state"] == "disconnected");
                 signal(&app, if disconnected { Signal::CameraDisconnected } else { Signal::LiveFrame });
-                let core_state = app.state::<crate::SharedCore>();
-                let mut core = core_state.lock().unwrap();
+                let life = app.state::<crate::Lifecycle>();
+                let mut core = life.core();
                 publish_facts(&core.session.report_progress(Progress { value, unit, satisfied }));
-                let snap = crate::persist_and_snapshot(&mut core);
+                let snap = life.persist(&mut core);
                 drop(core);
-                crate::emit_snapshot(&app, &snap);
+                life.emit(&snap);
                 if satisfied {
                     disable_metric_async(&app);
                 }
@@ -552,16 +552,16 @@ pub(crate) fn disable_metric_now(app: &AppHandle) {
 
 /// Honor-mode completion: the camera path failed, the user pressed Done.
 pub fn honor_complete(app: &AppHandle) -> Result<engine::types::Snapshot, String> {
-    let core_state = app.state::<crate::SharedCore>();
-    let mut core = core_state.lock().unwrap();
+    let life = app.state::<crate::Lifecycle>();
+    let mut core = life.core();
     let facts = core.session.honor_complete();
     if facts.is_empty() {
         return Err("No active workout to complete".into());
     }
     publish_facts(&facts);
-    let snap = crate::persist_and_snapshot(&mut core);
+    let snap = life.persist(&mut core);
     drop(core);
-    crate::emit_snapshot(app, &snap);
+    life.emit(&snap);
     disable_metric_async(app);
     Ok(snap)
 }

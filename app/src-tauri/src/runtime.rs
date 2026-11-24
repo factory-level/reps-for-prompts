@@ -118,7 +118,7 @@ mod isolation_tests {
         let _ = debug.session.start_workout(&SystemClock.today());
         let _ = debug.session.report_progress(Progress { value: 999.0, unit: "reps".into(), satisfied: true });
         let _ = debug.session.confirm_weight(25.0, &SystemClock.today());
-        crate::persist_and_snapshot(&mut debug);
+        crate::lifecycle::persist_and_snapshot(&mut debug, SystemClock.now());
         assert_eq!(debug.store.history(100).unwrap().len(), 1);
         assert_eq!(normal.store.history(100).unwrap().len(), before);
         assert_eq!(normal.store.setting("plan_state", ""), "real-plan-sentinel");

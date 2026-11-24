@@ -10,7 +10,7 @@ use std::sync::Mutex;
 
 use tauri::{AppHandle, Manager, Position, WindowEvent};
 
-use crate::SharedCore;
+use crate::Lifecycle;
 
 static WINDOW_ACTIONS: Mutex<()> = Mutex::new(());
 
@@ -60,11 +60,11 @@ pub(crate) fn pick_gym_monitor(names: &[&str], primary: &str, want: Option<&str>
 }
 
 fn setting(app: &AppHandle, key: &str) -> String {
-    app.state::<SharedCore>().lock().unwrap().store.setting(key, "")
+    app.state::<Lifecycle>().core().store.setting(key, "")
 }
 
 fn remember(app: &AppHandle, key: &str, value: &str) {
-    let _ = app.state::<SharedCore>().lock().unwrap().store.set_setting(key, value);
+    let _ = app.state::<Lifecycle>().core().store.set_setting(key, value);
 }
 
 /// Startup placement: main on the primary monitor, gym on its monitor.
