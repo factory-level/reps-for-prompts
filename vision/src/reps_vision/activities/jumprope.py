@@ -8,10 +8,12 @@ C920x footage before trusting the exact seconds.
 from __future__ import annotations
 
 from ..exercises import Landmarks
-from .base import Progress
+from .base import BreakActivity, Progress
 
 
-class JumpRopeActivity:
+class JumpRopeActivity(BreakActivity):
+    unit = "seconds"
+
     def __init__(
         self,
         target_seconds: float,

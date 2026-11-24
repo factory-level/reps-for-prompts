@@ -5,7 +5,7 @@ from copy import deepcopy
 import math
 
 from .angles import angle
-from .activities.base import Progress
+from .activities.base import BreakActivity, Progress
 
 JOINTS = {"shoulder", "elbow", "wrist", "hip", "knee", "ankle"}
 
@@ -58,7 +58,10 @@ def _number(value, low, high, field):
     return float(value)
 
 
-class MovementActivity:
+class MovementActivity(BreakActivity):
+    unit = "reps"
+    isotropic_landmarks = True
+
     def __init__(self, movement: dict, target_reps: int):
         self.movement = validate_movement(movement)
         if target_reps < 1:
@@ -83,7 +86,7 @@ class MovementActivity:
                 "reason": self.reason, "side": self.side, "features": dict(self.values),
                 "tracking": self.reason != "insufficient_visibility"}
 
-    def _reset(self, reason):
+    def reset(self, reason):
         self.next_phase = 0
         self.started = None
         self.dwell_start = None
@@ -123,7 +126,7 @@ class MovementActivity:
         dt = ms - self.last_time if self.last_time is not None else 0
         self.last_time = ms
         if self.last_valid is not None and ms - self.last_valid > self.movement["trackingLossMs"]:
-            self._reset("interrupted_tracking")
+            self.reset("interrupted_tracking")
         raw = self._measure(landmarks or {})
         if raw is None:
             self.dwell_start = None
@@ -134,7 +137,7 @@ class MovementActivity:
         alpha = 1 - math.exp(-dt / tau) if tau > 0 else 1
         self.values = {key: self.values.get(key, value) + alpha * (value - self.values.get(key, value)) for key, value in raw.items()}
         if self.started is not None and ms - self.started > self.movement["maxCycleMs"]:
-            self._reset("incomplete_range")
+            self.reset("incomplete_range")
             return self._progress()
         phase = self.movement["phases"][self.next_phase]
         matches = all(c.get("min", 0) <= self.values[c["feature"]] <= c.get("max", 180) for c in phase["conditions"])
@@ -151,7 +154,7 @@ class MovementActivity:
         if self.next_phase == 0:
             if self.started is not None:
                 if ms - self.started < self.movement["minCycleMs"]:
-                    self._reset("cycle_too_fast")
+                    self.reset("cycle_too_fast")
                     return self._progress()
                 self.completed_cycle = {"cycleId": str(self.count + 1),
                     "phases": [*self.phase_history, {"name": phase["name"], "atMs": ms}],

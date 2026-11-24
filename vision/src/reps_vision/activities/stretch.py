@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from ..exercises import Landmarks
-from .base import Progress
+from .base import BreakActivity, Progress
 
 
-class StretchActivity:
+class StretchActivity(BreakActivity):
+    unit = "seconds"
+
     def __init__(self, target_seconds: float) -> None:
         self._target = target_seconds
         self._start: float | None = None

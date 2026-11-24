@@ -3,21 +3,26 @@
 Camera-gating: the capture device is handed in already-open by the plugin's
 ``start_stream`` and released here when the loop stops — it is never open
 while no stream runs.
+
+The loop's collaborators are declared interfaces: ``Capture``
+(``live_capture.py``) and ``BreakActivity`` (``activities/base.py``).
 """
 
 from __future__ import annotations
 
 import threading
 import time
-import uuid
 import math
 import base64
+
+
+def _finite(value) -> bool:
+    return isinstance(value, (int, float)) and math.isfinite(value)
 
 
 class StreamLoop:
     def __init__(self, *, activity, spec, estimator, capture, emit, frame_times_ms=None, provenance=None, timing_calibration=None):
         self._timing = timing_calibration or {}
-        self._epoch = str(uuid.uuid4())
         self._clock_offset = time.time() * 1000 - time.monotonic() * 1000
         self._preview_at = 0.0
         self._frame_times_ms = frame_times_ms
@@ -26,6 +31,7 @@ class StreamLoop:
         self._spec = spec
         self._estimator = estimator
         self._capture = capture
+        self._epoch = capture.epoch
         self._emit = emit
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="reps-vision-stream", daemon=True)
@@ -37,22 +43,27 @@ class StreamLoop:
         self._stop.set()
         self._thread.join()
 
-    def _timing_eligible(self, ts_us):
+    def _timing_offset(self, ts_us):
+        """Ms to add to source times to place them on the shared consensus
+        clock, or None when this frame's timing cannot be trusted. The single
+        rule behind both ``timingEligible`` and ``cycleEvidence``."""
         uncertainty = self._timing.get("uncertaintyMs")
-        if not isinstance(uncertainty, (int, float)) or not math.isfinite(uncertainty) or uncertainty < 0:
-            return False
-        if hasattr(self._capture, "reconnected"):
-            delay = self._timing.get("delayMs")
-            expiry = self._timing.get("validUntilMs")
-            return (isinstance(delay, (int, float)) and math.isfinite(delay) and delay >= 0
-                    and isinstance(expiry, (int, float)) and math.isfinite(expiry) and ts_us / 1000 <= expiry
-                    and not self._capture.reconnected and not self._capture.timing_invalidated)
-        offset = self._timing.get("offsetMs")
-        return isinstance(offset, (int, float)) and math.isfinite(offset)
+        if not _finite(uncertainty) or uncertainty < 0 or not self._capture.timing_trusted():
+            return None
+        if not self._capture.live:
+            offset = self._timing.get("offsetMs")
+            return offset if _finite(offset) else None
+        delay = self._timing.get("delayMs")
+        # A live calibration is a measurement that goes stale, so it must carry
+        # a real deadline: a missing or non-finite validUntilMs (inf = "never
+        # expires") is rejected rather than trusted forever.
+        expiry = self._timing.get("validUntilMs")
+        if _finite(delay) and delay >= 0 and _finite(expiry) and ts_us / 1000 <= expiry:
+            return self._clock_offset - delay
+        return None
 
     def _run(self) -> None:
         last_value = 0.0
-        last_unit = "reps"
         was_satisfied = False
         source_ended = False
         frame_index = 0
@@ -60,8 +71,8 @@ class StreamLoop:
             while not self._stop.is_set():
                 ok, frame = self._capture.read()
                 if not ok:
-                    if hasattr(self._capture, "reconnected"):
-                        self._emit("progress", {**self._provenance, "value": last_value, "unit": last_unit, "satisfied": False,
+                    if self._capture.live:
+                        self._emit("progress", {**self._provenance, "value": last_value, "unit": self._activity.unit, "satisfied": False,
                             "cameraStatus": "disconnected"})
                         continue
                     source_ended = True
@@ -69,13 +80,12 @@ class StreamLoop:
                 frame_index += 1
                 ts_us = time.time_ns() // 1000
                 source_ms = (self._frame_times_ms[frame_index - 1] if self._frame_times_ms is not None
-                             else getattr(self._capture, "time_ms", None))
+                             else self._capture.time_ms)
                 if source_ms is None:
                     source_ms = time.monotonic() * 1000
-                if hasattr(self._capture, "epoch") and self._epoch != self._capture.epoch:
+                if self._epoch != self._capture.epoch:
                     self._epoch = self._capture.epoch
-                    if hasattr(self._activity, "_reset"):
-                        self._activity._reset("camera_reconnected")
+                    self._activity.reset("camera_reconnected")
                 if hasattr(frame, "shape") and time.monotonic() - self._preview_at >= .05:
                     import cv2
                     ok_jpeg, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
@@ -114,25 +124,17 @@ class StreamLoop:
                 # Pose coordinates normalize x and y independently. Temporal
                 # geometry needs isotropic coordinates; retain normalized points
                 # for overlays and preserve legacy tuned angle behavior.
-                if landmarks and hasattr(self._activity, "movement") and hasattr(frame, "shape"):
+                if landmarks and self._activity.isotropic_landmarks and hasattr(frame, "shape"):
                     aspect = frame.shape[1] / frame.shape[0]
                     activity_landmarks = {name: (p[0] * aspect, p[1], p[2]) for name, p in landmarks.items()}
                 progress = self._activity.update(activity_landmarks, source_ms / 1000)
+                offset = self._timing_offset(ts_us)
                 if progress.unit == "reps" and progress.value > last_value:
-                    cycle = getattr(self._activity, "completed_cycle", None)
+                    cycle = self._activity.completed_cycle
                     evidence = None
-                    uncertainty = self._timing.get("uncertaintyMs")
-                    offset = self._timing.get("offsetMs")
-                    if hasattr(self._capture, "reconnected"):
-                        delay = self._timing.get("delayMs")
-                        valid_until = self._timing.get("validUntilMs", 0)
-                        if isinstance(delay, (int, float)) and math.isfinite(delay) and delay >= 0 and isinstance(valid_until, (int, float)) and ts_us / 1000 <= valid_until and not self._capture.reconnected and not self._capture.timing_invalidated:
-                            offset = self._clock_offset - delay
-                        else:
-                            offset = None
-                    if cycle and all(isinstance(v, (int, float)) and math.isfinite(v) for v in (offset, uncertainty)) and uncertainty >= 0:
+                    if cycle and offset is not None:
                         evidence = {**cycle, "epoch": self._epoch, "subjectId": "scene-person-1",
-                            "uncertaintyMs": uncertainty,
+                            "uncertaintyMs": self._timing["uncertaintyMs"],
                             "phases": [{**p, "atMs": p["atMs"] + offset} for p in cycle["phases"]]}
                     self._emit("event", {"type": "rep_completed", "count": int(progress.value), "frameIndex": frame_index, "sourceTimeMs": source_ms,
                         "cycleEvidence": evidence, **self._provenance})
@@ -142,8 +144,8 @@ class StreamLoop:
                         "value": progress.value,
                         "unit": progress.unit,
                         "satisfied": progress.satisfied,
-                        "diagnostics": getattr(self._activity, "diagnostics", None),
-                        "timingEligible": self._timing_eligible(ts_us),
+                        "diagnostics": self._activity.diagnostics,
+                        "timingEligible": offset is not None,
                         "frameIndex": frame_index,
                         "sourceTimeMs": source_ms,
                         **self._provenance,
@@ -151,7 +153,6 @@ class StreamLoop:
                     },
                 )
                 last_value = progress.value
-                last_unit = progress.unit
                 if progress.satisfied and not was_satisfied:
                     self._emit("event", {"type": "target_reached", "value": progress.value, **self._provenance})
                 was_satisfied = progress.satisfied
