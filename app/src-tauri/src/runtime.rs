@@ -12,7 +12,6 @@ pub struct Runtime {
     pub normal_home: PathBuf,
     pub session_home: PathBuf,
     pub stopping: AtomicBool,
-    pub lock_mode: AtomicBool,
 }
 
 impl Runtime {
@@ -31,12 +30,11 @@ impl Runtime {
             }
             path
         } else { normal_home.clone() };
-        Ok(Self {mode, normal_home, session_home, stopping: AtomicBool::new(false), lock_mode: AtomicBool::new(false)})
+        Ok(Self {mode, normal_home, session_home, stopping: AtomicBool::new(false)})
     }
 
     pub fn is_debug(&self) -> bool { self.mode == AppMode::Debug }
     pub fn is_stopping(&self) -> bool { self.stopping.load(Ordering::SeqCst) }
-    pub fn enforces_windows(&self) -> bool { !self.is_debug() && !self.is_stopping() && self.lock_mode.load(Ordering::SeqCst) }
     pub fn require_debug(&self) -> Result<(), String> {
         if self.is_debug() && !self.is_stopping() { Ok(()) }
         else { Err("Manual testing requires Debug mode".into()) }
@@ -70,17 +68,14 @@ mod tests {
     fn defaults_to_debug_and_persists_both_choices() {
         let home = home();
         let runtime = Runtime::load(home.clone()).unwrap();
-        assert!(runtime.is_debug()); assert!(!runtime.enforces_windows());
+        assert!(runtime.is_debug());
         assert_ne!(runtime.session_home, home);
         assert!(!home.exists()); // Opening Debug did not create a real workout DB.
         runtime.save_mode(AppMode::Workout).unwrap(); runtime.cleanup();
         let normal = Runtime::load(home.clone()).unwrap();
-        assert_eq!(normal.session_home, home); assert!(!normal.enforces_windows());
-        normal.lock_mode.store(true, Ordering::SeqCst);
-        assert!(normal.enforces_windows());
+        assert_eq!(normal.session_home, home);
         assert!(normal.require_debug().is_err());
         assert!(normal.begin_stop()); assert!(!normal.begin_stop());
-        assert!(!normal.enforces_windows());
         normal.save_mode(AppMode::Debug).unwrap();
         let debug = Runtime::load(home.clone()).unwrap();
         assert!(debug.require_debug().is_ok());
@@ -93,7 +88,7 @@ mod tests {
         std::fs::write(home.join("mode.json"), "broken").unwrap();
         std::fs::write(home.join("reps.sqlite"), "real-history").unwrap();
         let runtime = Runtime::load(home.clone()).unwrap();
-        assert!(!runtime.enforces_windows());
+        assert!(runtime.is_debug());
         assert!(!runtime.session_home.join("reps.sqlite").exists());
         runtime.cleanup();
         assert_eq!(std::fs::read_to_string(home.join("reps.sqlite")).unwrap(), "real-history");
@@ -114,9 +109,10 @@ mod isolation_tests {
         let before = normal.store.history(100).unwrap().len();
         let runtime = Runtime::load(home.clone()).unwrap();
         let mut debug = crate::build_core(&runtime.session_home);
+        let _ = debug.session.start(SystemClock.now(), &SystemClock.today());
         let _ = debug.session.start_workout(&SystemClock.today());
         let _ = debug.session.report_progress(Progress { value: 999.0, unit: "reps".into(), satisfied: true });
-        let _ = debug.session.confirm_weight(25.0, &SystemClock.today());
+        let _ = debug.session.confirm_weight(25.0, None, &SystemClock.today());
         crate::lifecycle::persist_and_snapshot(&mut debug, SystemClock.now());
         assert_eq!(debug.store.history(100).unwrap().len(), 1);
         assert_eq!(normal.store.history(100).unwrap().len(), before);

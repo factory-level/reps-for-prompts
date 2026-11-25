@@ -16,8 +16,9 @@ use engine::workout::WorkoutEngine;
 use serde::{Deserialize, Serialize};
 
 /// Default daily routine, overridden by routine.json in the app data directory.
-const ROUTINE_JSON: &str = include_str!("../resources/routine.json");
+pub(crate) const ROUTINE_JSON: &str = include_str!("../resources/routine.json");
 
+#[cfg(test)]
 fn load_daily_plan(dir: &Path, today: &str) -> Result<DailyPlan, String> {
     let path = dir.join("routine.json");
     let json = match std::fs::read_to_string(&path) {
@@ -37,6 +38,10 @@ pub(crate) struct PlanState {
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
 
 mod detector;
+mod training;
+mod prompt;
+mod tray;
+mod ui;
 mod hub;
 mod lifecycle;
 mod vision_status;
@@ -79,6 +84,26 @@ pub fn check_runtime() -> Result<serde_json::Value, String> {
 pub(crate) struct Core {
     pub(crate) session: Session,
     pub(crate) store: Store,
+    /// Where plan.json lives (the session home).
+    pub(crate) home: PathBuf,
+    /// The workout session under way, if any.
+    pub(crate) active: Option<Active>,
+    /// The routine just completed, for the gym's WORKOUT COMPLETE screen.
+    pub(crate) last_completed: Option<String>,
+}
+
+/// One workout session: a routine from one cycle slot, persisted so a
+/// restart can recover it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Active {
+    pub(crate) id: String,
+    pub(crate) routine_id: String,
+    pub(crate) routine_name: String,
+    pub(crate) slot_id: String,
+    pub(crate) slot_index: usize,
+    pub(crate) slot_count: usize,
+    pub(crate) coding_minutes: f64,
 }
 
 fn build_core(dir: &Path) -> Core {
@@ -97,23 +122,20 @@ fn build_core(dir: &Path) -> Core {
     workout.restore(pointer, used, &date);
     let mut session = Session::new(CodingTimer::new(work_minutes * 60.0), workout);
 
-    // Drive prescription from the routine.json daily plan (falls back to the
-    // rotation if the routine fails to parse). Restore today's completion.
-    let today = SystemClock.today();
-    match load_daily_plan(&dir, &today) {
-        Ok(mut plan) => {
-            if let Ok(ps) = serde_json::from_str::<PlanState>(&store.setting("plan_state", "")) {
-                if !ps.date.is_empty() {
-                    plan.restore(&ps.date, &ps.done);
-                    plan.roll_date(&today); // clears completion if it's a new day
-                }
+    // V2: no session until the user starts one. A session that was under way
+    // when the app stopped is restored (Lifecycle::begin brings it back paused).
+    let mut active = serde_json::from_str::<Active>(&store.setting("active_workout", "")).ok();
+    if let Some(a) = &active {
+        let plan = training::load(dir, ROUTINE_JSON);
+        match plan.routines.iter().find(|r| r.id == a.routine_id).map(|r| DailyPlan::from_routine_json(&training::routine_json(r), &SystemClock.today())) {
+            Some(Ok(mut daily)) => {
+                if let Ok(ps) = serde_json::from_str::<PlanState>(&store.setting("plan_state", "")) { daily.restore(&ps.date, &ps.done); }
+                session.set_plan(daily);
             }
-            session.set_plan(plan);
+            _ => { eprintln!("could not restore the workout in progress"); active = None; }
         }
-        Err(e) => eprintln!("routine.json failed to load, using rotation: {e}"),
     }
-
-    Core { session, store }
+    Core { session, store, home: dir.to_path_buf(), active, last_completed: None }
 }
 
 fn dirs_next_data_dir() -> std::path::PathBuf { engine::activity::app_home() }
@@ -133,6 +155,7 @@ pub(crate) fn print_state(snap: &Snapshot) {
         .unwrap_or_default();
     let value = snap.progress.as_ref().map(|p| p.value.round() as i64).unwrap_or(0);
     let line = match snap.phase {
+        Phase::Idle => "[STATE] 💤 IDLE · no workout session".to_string(),
         Phase::Coding => {
             let rem = snap.remaining_seconds.max(0.0) as u64;
             let next = snap.rotation.get(snap.pointer).map(|s| s.as_str()).unwrap_or("—");
@@ -163,9 +186,8 @@ impl lifecycle::Effects for TauriEffects {
         let app = &self.0;
         if app.state::<Runtime>().is_stopping() { return; }
         print_state(snap);
-        // Debt owed → the programming monitor is locked (fullscreen, on top).
-        windows::apply_lock(app, snap.phase != Phase::Coding);
         let _ = app.emit("snapshot", snap);
+        ui::publish(app);
     }
     fn vision(&self, status: vision_status::VisionStatus) { control::vision(&self.0, status); }
     fn camera_frame(&self, camera_id: &str, data: &serde_json::Value) {
@@ -192,7 +214,6 @@ fn stop_debug_process(app: &AppHandle) {
 }
 
 fn shutdown_runtime(app: &AppHandle) {
-    windows::release(app);
     stop_debug_process(app);
     hub::stop(app);
     app.state::<Runtime>().cleanup();
@@ -463,12 +484,13 @@ pub fn run() {
     };
     let runtime = Runtime::load(dirs_next_data_dir()).expect("load application mode");
     let core = build_core(&runtime.session_home);
-    runtime.lock_mode.store(false, std::sync::atomic::Ordering::SeqCst);
+    // Lock mode is gone (V2): make sure no old setting can bring it back.
     let _ = core.store.set_setting("lock_mode", "0");
     let snooze_until = core.store.setting("snooze_until", "0").parse().unwrap_or(0.);
     let app = tauri::Builder::default()
         .manage(Mutex::new(control::DisplayState::default()))
         .manage(Mutex::new(daily::Daily { agents: Default::default(), snooze_until, checked_at: 0. }))
+        .manage(Mutex::new(ui::Ui::default()) as ui::SharedUi)
         .manage(runtime)
         .manage(Mutex::new(DebugProcess {
             generation: 0,
@@ -477,19 +499,24 @@ pub fn run() {
         .manage(hub::SharedHub::default())
         .invoke_handler(tauri::generate_handler![
             control::get_display_state,
-            control::workout_action,
             get_snapshot,
-            get_app_mode
+            get_app_mode,
+            ui::get_app_state, ui::get_plan, ui::save_plan, ui::catalog,
+            ui::prepare_workout, ui::cancel_setup, ui::start_session, ui::start_set,
+            ui::manual_finish, ui::confirm_set, ui::snooze, ui::dismiss_prompt,
+            ui::pause, ui::resume, ui::end_workout,
+            ui::history, ui::exercise_history, ui::week,
+            ui::show_gym, ui::show_main, ui::toggle_fullscreen,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                if window.label() == "main" {
-                    api.prevent_close();
-                    if window.app_handle().state::<Runtime>().is_debug() { window.app_handle().exit(0); }
-                    else { let _ = window.hide(); }
-                } else if window.app_handle().state::<Runtime>().is_debug() {
-                    api.prevent_close();
-                    let _ = window.hide();
+                api.prevent_close();
+                match window.label() {
+                    // Closing the launcher hides it to the tray; Quit is explicit.
+                    "main" if window.app_handle().state::<Runtime>().is_debug() && !tray::available() => window.app_handle().exit(0),
+                    // Closing a prompt is "not now": it comes back if still due.
+                    "prompt" => ui::dismiss(window.app_handle()),
+                    _ => { let _ = window.hide(); }
                 }
             }
         })
@@ -517,14 +544,14 @@ pub fn run() {
                     }
                 });
             }
+            if let Err(error) = tray::build(app.handle()) { eprintln!("tray unavailable: {error}"); }
             hub::start(app.handle().clone());
             windows::place(app.handle());
             let handle = app.handle().clone();
-            // The coding timer starts the moment the app does — no "start" button.
+            // Nothing counts down until Start Session; a recovered session comes back paused.
             handle.state::<Lifecycle>().begin();
             std::thread::spawn(move || {
                 let mut previous = SystemClock.now();
-                let mut last_poll = 0.;
                 loop {
                     std::thread::sleep(Duration::from_secs(1));
                     let clock = SystemClock;
@@ -532,65 +559,30 @@ pub fn run() {
                     let life = handle.state::<Lifecycle>();
                     let runtime = handle.state::<Runtime>();
                     if runtime.is_stopping() { break; }
-                    let poll_due = now - last_poll >= 5.;
                     let elapsed = (now - previous).max(0.); previous = now;
-                    let (defer, snooze_expired, can_remind) = {
+                    let (defer, snooze_expired, snoozed) = {
                         let daily_state = handle.state::<daily::SharedDaily>();
                         let mut daily = daily_state.lock().unwrap();
-                        if poll_due { daily::refresh(&mut daily); last_poll = now; }
-                        let defer = engine::activity::excluded_elapsed(elapsed, daily.agents.active() && !life.previewing(), daily.snooze_until > now);
+                        let snoozed = daily.snooze_until > now;
+                        // Sleep/suspend is not coding time: a jump over 5s is deferred.
+                        let defer = engine::activity::excluded_elapsed(elapsed, true, snoozed);
                         let snooze_expired = daily.snooze_until > 0. && daily.snooze_until <= now;
                         if snooze_expired { daily.snooze_until = 0.; }
-                        (defer, snooze_expired, daily.agents.active() && daily.snooze_until <= now && !life.previewing())
+                        (defer, snooze_expired, snoozed)
                     };
-                    let before = life.snapshot();
-                    let warn = {
-                        let core = life.core();
-                        if snooze_expired { let _ = core.store.set_setting("snooze_until", "0"); }
-                        if poll_due {if let Some(plan)=core.session.plan(){let day=plan.to_day_plan();let _=core.store.record_routine_day(plan.date(),day.sets_done,day.sets_total);}}
-                        let remaining = before.day.as_ref().map(|d|d.sets_total.saturating_sub(d.sets_done)).unwrap_or(0);
-                        let end = reps_cli::workday::parse_time(&core.store.setting("workday_end","18:00")).unwrap_or(1080);
-                        let lead = core.store.setting("workday_warn_minutes","60").parse().unwrap_or(60);
-                        let warn = poll_due && reps_cli::workday::due(reps_cli::workday::local_minute(),end,lead,
-                            !runtime.is_debug() && can_remind && matches!(before.phase,Phase::Coding|Phase::ExerciseRequired),
-                            remaining,core.store.setting("last_day_warning","")==today);
-                        let warned = warn && core.store.set_setting("last_day_warning",&today).is_ok();
-                        // Clear a warning after starting a set or when the local date changes.
-                        let stale = !matches!(before.phase,Phase::Coding|Phase::ExerciseRequired) || core.store.setting("last_day_warning","")!=today;
-                        drop(core);
-                        if warned {
-                            let message=format!("Your workday is ending soon or has ended. {remaining} workout sets remain — you might miss today's routine. Start when ready: rfp start");
-                            let display={let state=handle.state::<control::SharedDisplay>();let mut display=state.lock().unwrap();display.notice=Some(message.clone());display.clone()};
-                            let _=handle.emit("display-state",display);
-                            daily::notify(message);
-                            if let Some(window)=handle.get_webview_window("main"){let _=window.show();let _=window.unminimize();}
-                        }
-                        if stale {
-                            let changed={let state=handle.state::<control::SharedDisplay>();let mut display=state.lock().unwrap();display.notice.take().map(|_|display.clone())};
-                            if let Some(display)=changed{let _=handle.emit("display-state",display);}
-                        }
-                        (warn, warned)
-                    };
+                    if snooze_expired { let _ = life.core().store.set_setting("snooze_until", "0"); }
                     let (snap, locked) = life.tick(now, &today, lifecycle::Tick {
                         defer,
-                        // A snooze ran out, or the workday warning asks for the set now.
-                        expire: snooze_expired || (warn.1 && before.phase == Phase::Coding),
-                        remind: can_remind,
-                        auto_start: runtime.enforces_windows(),
+                        expire: snooze_expired,
+                        remind: !snoozed,
                     });
-                    if locked {
-                        // Show the passive reminder; CLI starts the camera.
-                        if !warn.0 {daily::notify("Time for a little movement. Start your next workout from the terminal: rfp start".into());}
-                        if !runtime.enforces_windows() {
-                            if let Some(window) = handle.get_webview_window("main") { let _ = window.show(); let _ = window.unminimize(); }
-                        }
+                    if locked { daily::notify("Time to move. Your next set is ready.".into()); }
+                    ui::tick(&handle, &snap, now, snoozed);
+                    if (now as u64) % 5 == 0 {
+                        let status = serde_json::json!({"pid":std::process::id(),"updatedAt":now,"phase":snap.phase,"remainingSeconds":snap.remaining_seconds,"paused":snap.paused,"mode":runtime.mode,"lockMode":false});
+                        let home = &runtime.session_home;
+                        if std::fs::write(home.join("status.json.tmp"), status.to_string()).is_ok() { let _ = std::fs::rename(home.join("status.json.tmp"), home.join("status.json")); }
                     }
-                    let presence = handle.state::<daily::SharedDaily>().lock().unwrap().agents.clone();
-                    let runtime_status = serde_json::json!({"pid":std::process::id(),"updatedAt":now,"agents":presence,"phase":snap.phase,"remainingSeconds":snap.remaining_seconds,"mode":runtime.mode,"lockMode":runtime.enforces_windows()});
-                    let status_home = &runtime.session_home;
-                    if poll_due && std::fs::write(status_home.join("status.json.tmp"), runtime_status.to_string()).is_ok() { let _ = std::fs::rename(status_home.join("status.json.tmp"), status_home.join("status.json")); }
-                    windows::refocus(&handle);
-                    windows::assert_gym(&handle);
                 }
             });
             Ok(())
@@ -599,11 +591,12 @@ pub fn run() {
         .expect("error while building tauri application");
 
     app.run(|handle, event| {
-        if let RunEvent::ExitRequested { .. } = event {
+        if let RunEvent::ExitRequested { api, code, .. } = event {
+            // Closing the last window is not Quit while the tray can bring it back.
+            if code.is_none() && tray::available() && !handle.state::<Runtime>().is_stopping() { api.prevent_exit(); return; }
             handle.state::<Runtime>().begin_stop();
             shutdown_runtime(handle);
         }
-
     });
 }
 

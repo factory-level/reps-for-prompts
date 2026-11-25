@@ -87,36 +87,27 @@ fn dispatch(app:&AppHandle, command:Command)->Result<serde_json::Value,String>{
    let w=app.get_webview_window(&window).ok_or("Window unavailable")?;
    let monitors=w.available_monitors().map_err(|e|e.to_string())?;
    if let Some(index)=monitor{let m=monitors.get(index).ok_or("Invalid monitor index")?;w.set_position(tauri::Position::Physical(*m.position())).map_err(|e|e.to_string())?;}
-   if let Some(on)=fullscreen{if app.state::<Runtime>().enforces_windows()&&!on{return Err("Disable lock mode first".into());}w.set_fullscreen(on).map_err(|e|e.to_string())?;}
+   if let Some(on)=fullscreen{w.set_fullscreen(on).map_err(|e|e.to_string())?;}
    if let Some(on)=visible{if on{w.show()}else{w.hide()}.map_err(|e|e.to_string())?;}
    return Ok(serde_json::json!({"window":window,"monitors":monitors.iter().enumerate().map(|(i,m)|serde_json::json!({"index":i,"name":m.name(),"width":m.size().width,"height":m.size().height})).collect::<Vec<_>>()}));
   },
-  Command::Start=>{view(app,"screen",false);daily::reminder_action(app.clone(),"start".into(),None)?;if let Some(w)=app.get_webview_window("main"){let _=w.show();let _=w.unminimize();}},
+  // Idle: start the next routine's session. Otherwise: start the set that's due.
+  Command::Start=>{view(app,"screen",false);if app.state::<Lifecycle>().snapshot().phase==Phase::Idle{crate::ui::begin_session(app)?;}else{daily::reminder_action(app.clone(),"start".into(),None)?;}},
   Command::Snooze{minutes}=>daily::reminder_action(app.clone(),"snooze".into(),Some(minutes))?,
   Command::Skip=>daily::reminder_action(app.clone(),"skip".into(),None)?,
-  Command::Cancel=>{view(app,"screen",false);crate::stop_debug_process(app);app.state::<Lifecycle>().cancel();},
+  // Ends the session early: confirmed sets stay, the cycle does not move.
+  Command::Cancel=>{view(app,"screen",false);crate::stop_debug_process(app);if app.state::<Runtime>().is_debug(){app.state::<Lifecycle>().cancel();}else{app.state::<Lifecycle>().end_workout();}},
   Command::Finish{weight,honor}=>{app.state::<Lifecycle>().finish(weight,honor)?;},
   Command::Settings{minutes,lock_mode}=>{
-   if lock_mode==Some(true){return Err("CLI-only displays cannot take over the terminal; lock mode must stay off".into());}
-   let (current_minutes,current_lock)={let life=app.state::<Lifecycle>();let core=life.core();(core.store.setting("work_minutes","25").parse().unwrap_or(25),core.store.setting("lock_mode","0")=="1")};
-   if minutes.is_some()||lock_mode.is_some(){daily::save_daily_settings(app.clone(),minutes.unwrap_or(current_minutes),lock_mode.unwrap_or(current_lock))?;}
+   if lock_mode==Some(true){return Err("RFP never locks the desktop; lock mode was removed".into());}
+   if let Some(minutes)=minutes{daily::save_daily_settings(app.clone(),minutes)?;}
   },
   Command::Routine{json}=>{if let Some(s)=json{daily::save_routine(app.clone(),s)?;}return serde_json::from_str(&daily::routine_settings(app.clone())?).map_err(|e|e.to_string());},
   Command::Show=>{if let Some(w)=app.get_webview_window("main"){let _=w.show();let _=w.unminimize();}},
-  Command::Hide=>{if app.state::<Runtime>().enforces_windows(){return Err("Disable lock mode before hiding screens: reps settings --lock-mode off".into());}for w in app.webview_windows().values(){let _=w.hide();}},
+  Command::Hide=>{for w in app.webview_windows().values(){let _=w.hide();}},
  }
  let snapshot=app.state::<Lifecycle>().snapshot();
  Ok(serde_json::json!({"schemaVersion":1,"source":"local","capabilities":{"siteProfiles":true},"pid":std::process::id(),"mode":app.state::<Runtime>().mode,"sessionHome":app.state::<Runtime>().session_home,"display":get_display_state(app.clone()),"snapshot":snapshot,"settings":daily::daily_status(app.clone())}))
-}
-/// The display exposes only the two actions also available through the CLI.
-#[tauri::command]
-pub fn workout_action(app:AppHandle, action:String, weight:Option<f64>)->Result<serde_json::Value,String>{
- let command=match action.as_str(){
-  "start"=>Command::Start,
-  "finish"=>Command::Finish{weight:weight.ok_or("Enter a weight")?,honor:false},
-  _=>return Err("Use the CLI for this action".into()),
- };
- dispatch(&app,command)
 }
 pub fn start(app:&AppHandle)->Result<(),String>{
  #[cfg(unix)] {

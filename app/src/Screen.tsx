@@ -1,148 +1,133 @@
 import { invoke } from "@tauri-apps/api/core";
-import { useRef, useState } from "react";
-import type { Snapshot } from "./snapshot";
+import { useLayoutEffect, useRef, useState } from "react";
+import type { AppState, Snapshot } from "./snapshot";
+import { titleCase } from "./snapshot";
 
-export type Variant = "primary" | "gym";
 /** The backend's one answer to "is the camera/vision path working right now?" */
 export type Vision = { state: "starting" | "available" | "unavailable"; reason?: string };
-
 
 export const mmss = (s: number) =>
   `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
 
-export const debtOf = (snapshot: Snapshot): number | null =>
-  snapshot.day ? snapshot.day.setsTotal - snapshot.day.setsDone : null;
-
-function WorkoutControl({ initial }: { initial?: number }) {
- const [weight,setWeight]=useState(String(initial ?? 0));
- const [pending,setPending]=useState(false);
- const [error,setError]=useState<string|null>(null);
- const busy=useRef(false);
- const finishing=initial!==undefined;
- async function submit(){
-  if(busy.current)return;
-  const value=Number(weight);
-  if(finishing&&(!weight.trim()||!Number.isFinite(value)||value<0||value>100000)){
-   setError("Enter a weight from 0 to 100000 lb.");return;
-  }
-  busy.current=true;setPending(true);setError(null);
-  try{await invoke("workout_action",{action:finishing?"finish":"start",weight:finishing?value:null});}
-  catch(e){setError(String(e));}
-  finally{busy.current=false;setPending(false);}
- }
- return <form className="workout-control" onSubmit={e=>{e.preventDefault();void submit();}}>
-  {finishing&&<label>Weight (lb)<input className="weight" type="number" min="0" max="100000" step="any" required value={weight} disabled={pending} onChange={e=>setWeight(e.target.value)}/></label>}
-  <button type="submit" disabled={pending}>{pending?"Working…":finishing?"Log weight":"Start workout"}</button>
-  <span className="small">{finishing?`rfp finish --weight ${weight || 0}`:"rfp start"}</span>
-  {error&&<span className="small" role="alert">{error}</span>}
- </form>;
+export function FullscreenButton() {
+  const [on, setOn] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const toggle = () => invoke<boolean>("toggle_fullscreen").then((v) => { setOn(v); setError(null); }, (e) => setError(String(e)));
+  return (
+    <button className="fullscreen-toggle" onClick={() => void toggle()} title={error ?? undefined} aria-label={on ? "Exit fullscreen" : "Fullscreen"}>
+      {on ? "Exit fullscreen" : "Fullscreen"}
+    </button>
+  );
 }
 
-function WeightEntry({ initial }: { initial: number }) {
- return <><span className="medium">Set complete</span><WorkoutControl initial={initial}/></>;
+/** Title sized to span the full width, capped so it never pushes the status off screen. */
+export function FitTitle({ text }: { text: string }) {
+  const ref = useRef<HTMLHeadingElement>(null);
+  useLayoutEffect(() => {
+    const el = ref.current, box = el?.parentElement;
+    if (!el || !box) return;
+    const fit = () => {
+      el.style.fontSize = "100px";
+      if (!el.scrollWidth) return;
+      // Leave the siblings (status, LOGGED check) visible.
+      const room = [...box.children].reduce((h, c) => (c === el || c.classList.contains("fullscreen-toggle") ? h : h - c.clientHeight), box.clientHeight);
+      el.style.fontSize = `${Math.max(24, Math.min((100 * box.clientWidth * 0.96) / el.scrollWidth, (100 * room * 0.9) / el.offsetHeight))}px`;
+    };
+    fit();
+    void document.fonts?.ready.then(fit);
+    if (typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(fit);
+    ro.observe(box);
+    return () => ro.disconnect();
+  }, [text]);
+  return <h1 ref={ref} className="title">{text}</h1>;
 }
 
-function PrimaryStatus({ snapshot, fallback, debug }: { snapshot: Snapshot; fallback: boolean; debug: boolean }) {
+/** The gym monitor's word and status for the current state (spec §4.4, M01–M08). */
+function view(snapshot: Snapshot, app: AppState | null, vision: Vision | undefined, debug: boolean) {
+  const rx = snapshot.prescription;
+  const day = snapshot.day;
+  const item = day?.items.find((i) => i.name === rx?.exercise);
+  const label = item?.label ?? (rx ? titleCase(rx.exercise) : "");
+  const reps = rx?.kind === "REP";
+  const target = reps ? rx?.targetReps ?? 0 : rx?.targetSeconds ?? 0;
+  const setOf = item ? `Set ${Math.min(item.done + 1, item.total)} of ${item.total}` : "";
+  const routine = app?.routine;
+  const progress = day ? `${routine?.name ?? ""} · set ${Math.min(day.setsDone + 1, day.setsTotal)} of ${day.setsTotal}` : routine?.name ?? "";
+  const next = day?.items.find((i) => i.done < i.total);
+  if (snapshot.paused) return { mode: "code", word: "PAUSED", lines: [<span key="a" className="small">Resume from the tray or your computer</span>] };
   switch (snapshot.phase) {
+    case "IDLE":
+      if (debug) return { mode: "code", word: "DEBUG", lines: [<span key="a" className="small">Idle · start a test when you’re ready</span>] };
+      if (app?.setup) return {
+        mode: "code", word: "READY", lines: [
+          <span key="a" className="medium">{app.next?.name ?? "No routine"}</span>,
+          <span key="b" className="small">Move this window to your gym screen, then start.</span>,
+          <button key="c" className="gym-start" onClick={() => void invoke("start_session")}>Start session</button>,
+        ],
+      };
+      if (app?.lastCompleted) return {
+        mode: "done", word: "WORKOUT COMPLETE", lines: [
+          <span key="a" className="medium">{app.lastCompleted}</span>,
+          <span key="b" className="small">{app.week.done} of {app.week.target} this week · next: {app.next?.name ?? "—"}</span>,
+        ],
+      };
+      return { mode: "code", word: "RFP", lines: [<span key="a" className="small">Start a workout from your computer</span>] };
     case "CODING":
-      return <><span className="small">{debug ? "Idle · start a test when you’re ready" : `Next workout in ${mmss(snapshot.remainingSeconds)}`}</span>{!debug&&!snapshot.day?.complete&&<WorkoutControl/>}</>;
+      return {
+        mode: "code", word: debug ? "DEBUG" : "CODE", lines: [
+          <span key="a" className="big">{mmss(snapshot.remainingSeconds)}</span>,
+          <span key="b" className="small">{next ? `Next: ${next.label} · ${next.target} ${next.unit === "reps" ? "reps" : "sec"}` : progress}</span>,
+        ],
+      };
     case "EXERCISE_REQUIRED":
-      return <><span className="small">Time for a little movement · start when ready</span>{!debug&&<WorkoutControl/>}</>;
+      return {
+        mode: "workout", word: "MOVE", lines: [
+          <span key="a" className="medium">{label}</span>,
+          <span key="b" className="small">{setOf} · {target} {reps ? "reps" : "sec"} · start from your computer</span>,
+        ],
+      };
     case "WEIGHT_CONFIRMATION":
-      return <WeightEntry key={snapshot.prescription?.exercise} initial={snapshot.prescription?.defaultWeight ?? 0} />;
+      return {
+        mode: "workout", word: "SET COMPLETE", lines: [
+          <span key="a" className="medium">{label}</span>,
+          <span key="b" className="small">Return to your computer to log it</span>,
+        ],
+      };
     default: {
-      const debt = debtOf(snapshot);
-      const rx = snapshot.prescription;
-      const label = snapshot.day?.items.find((i) => i.name === rx?.exercise)?.label ?? rx?.exercise ?? "";
-      const reps = rx?.kind === "REP";
-      const target = reps ? rx?.targetReps ?? 0 : rx?.targetSeconds ?? 0;
-      return (
-        <>
-          <span className="medium">
-            {label} · {Math.floor(snapshot.progress?.value ?? 0)} / {target} {reps ? "reps" : "sec"}
-          </span>
-          {debt !== null && <div className="remaining-sets">
-            <span className="big">{debt}</span>
-            <span className="small">{debt === 1 ? "set" : "sets"} left today</span>
-            <span className="small">Including this set · {snapshot.day!.setsDone} of {snapshot.day!.setsTotal} complete</span>
-          </div>}
-          <span className="small">{fallback ? "Camera down · finish via rfp finish --honor" : debug ? "Test progress · not saved to your workouts" : "A little movement between prompts"}</span>
-        </>
-      );
+      const manual = vision?.state === "unavailable";
+      const value = Math.floor(snapshot.progress?.value ?? 0);
+      return {
+        mode: "workout", word: debug ? "TEST WORKOUT" : "MOVE", lines: [
+          <span key="h" className="medium">{label}</span>,
+          <span key="a" className="big">{reps ? `${String(value).padStart(2, "0")} / ${target}` : `${mmss(value)} / ${mmss(target)}`}</span>,
+          <span key="b" className="small">{manual ? "MANUAL MODE · finish on your computer" : `${setOf} · ${reps ? "reps" : "seconds"}`}</span>,
+        ],
+      };
     }
   }
 }
 
-function GymStatus({ snapshot, debug }: { snapshot: Snapshot; debug: boolean }) {
-  const rx = snapshot.prescription;
-  const label = snapshot.day?.items.find((i) => i.name === rx?.exercise)?.label ?? rx?.exercise ?? "";
-  const reps = rx?.kind === "REP";
-  const target = reps ? rx?.targetReps ?? 0 : rx?.targetSeconds ?? 0;
-  const unit = reps ? "reps" : "sec";
-  const pad3 = (n: number) => String(Math.floor(n)).padStart(3, "0");
-  switch (snapshot.phase) {
-    case "CODING":
-      return <span className="small">{debug ? "Idle · start a test when you’re ready" : `Next workout in ${mmss(snapshot.remainingSeconds)}`}</span>;
-    case "WEIGHT_CONFIRMATION":
-      return (
-        <>
-          <span className="small">Set done</span>
-          <span className="big">{pad3(target)}</span>
-          <span className="small">
-            / {target} {unit}
-          </span>
-        </>
-      );
-    default:
-      return (
-        <>
-          <span className="small">{label}</span>
-          <span className="big">{pad3(snapshot.progress?.value ?? 0)}</span>
-          <span className="small">
-            / {target} {unit}
-          </span>
-        </>
-      );
-  }
-}
-
-export function Screen({ snapshot, variant, debug = false, vision }: { snapshot: Snapshot; variant: Variant; debug?: boolean; vision?: Vision }) {
-  const coding = snapshot.phase === "CODING";
-  const mode = coding ? "code" : "workout";
-  const fallback = vision?.state === "unavailable" && snapshot.phase === "WORKOUT_ACTIVE";
-
-  // Set logged → whole-screen takeover for the beat before CODE.
+export function Screen({ snapshot, app = null, debug = false, vision }: { snapshot: Snapshot; app?: AppState | null; debug?: boolean; vision?: Vision }) {
+  // Set logged → whole-screen beat before the next interval.
   if (snapshot.phase === "UNLOCKED") {
     return (
-      <div className="takeover" data-phase="UNLOCKED">
+      <div className="takeover" data-phase="UNLOCKED" data-tauri-drag-region="deep">
+        <FullscreenButton />
         <svg className="check" viewBox="0 0 100 100" role="img" aria-label="logged">
-          <circle cx="50" cy="50" r="44" fill="var(--go)" stroke="var(--ink)" strokeWidth="6" />
-          <path d="M28 52 L44 68 L74 36" fill="none" stroke="var(--ivory)" strokeWidth="12" strokeLinecap="round" strokeLinejoin="round" />
+          <circle cx="50" cy="50" r="44" fill="var(--go)" stroke="var(--type)" strokeWidth="6" />
+          <path d="M28 52 L44 68 L74 36" fill="none" stroke="var(--type)" strokeWidth="12" strokeLinecap="round" strokeLinejoin="round" />
         </svg>
-        <h1 className="title">{debug ? "TEST COMPLETE" : "LOGGED"}</h1>
+        <FitTitle text={debug ? "TEST COMPLETE" : "SET LOGGED"} />
       </div>
     );
   }
-
+  const v = view(snapshot, app, vision, debug);
   return (
-    <div className={`stage ${mode}`} data-phase={snapshot.phase}>
-      {/* Animated WebP, not <video>: WebKitGTK's looping media pipeline leaks
-          ~6MB/s. Falls back to the still if the animation fails to load. */}
-      <img
-        key={mode}
-        className="scene"
-        src={`/art/scene-${mode}.webp`}
-        alt=""
-        aria-hidden
-        onError={(e) => {
-          e.currentTarget.src = `/art/scene-${mode}.png`;
-        }}
-      />
-      <h1 className="title">{debug ? (coding ? "DEBUG" : "TEST WORKOUT") : (coding ? "CODE" : "WORKOUT")}</h1>
-      <div className="character" />
-      <div className="status">
-        {variant === "gym" ? <GymStatus snapshot={snapshot} debug={debug} /> : <PrimaryStatus snapshot={snapshot} fallback={fallback} debug={debug} />}
-      </div>
+    <div className={`stage ${v.mode}`} data-phase={snapshot.phase} data-tauri-drag-region="deep">
+      <FullscreenButton />
+      <FitTitle text={v.word} />
+      <div className="status" role="status">{v.lines}</div>
     </div>
   );
 }

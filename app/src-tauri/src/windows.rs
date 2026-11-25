@@ -1,54 +1,13 @@
-// Two windows, one controller. `main` is the programming monitor: it goes
-// fullscreen + always-on-top while a workout is owed (soft lock — no OS lock,
-// see spec §14). `gym` is the big display: a draggable maximized window placed
-// on the remembered (else non-primary) monitor; F11 in it toggles fullscreen.
-// Where it was left — monitor + fullscreen — is saved in settings, so it comes
-// back in the same place next launch.
-use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
-
-use tauri::{AppHandle, Manager, Position, WindowEvent};
+//! Window roles (V2 spec §10.2). `main` is the launcher/config window, a
+//! normal app window. `gym` is the workout monitor on its own display:
+//! placed on the remembered (else non-primary) monitor, fullscreen unless the
+//! user turned that off. `prompt` is the small work-desktop reminder, centered
+//! on a display that isn't the gym's. Nothing here touches other apps'
+//! windows, locks input, or steals focus on a loop.
+use tauri::{AppHandle, Manager, PhysicalPosition, Position, WindowEvent};
 
 use crate::Lifecycle;
 
-static WINDOW_ACTIONS: Mutex<()> = Mutex::new(());
-
-static LOCKED: AtomicBool = AtomicBool::new(false);
-/// Other apps' windows we iconified for the lock; mapped back on unlock.
-static HIDDEN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
-const X11_WINDOWS_PY: &str = include_str!("x11_windows.py");
-
-/// Minimize (or restore) every other app's window via X11 — Tauri can't reach
-/// them. Silent no-op without python3-xlib / outside X11.
-// ponytail: shells out to python-xlib once a second while locked (~30ms);
-// swap for x11rb if that ever shows up in a profile.
-fn other_windows(mode: &str, ids: &[u32]) -> Vec<u32> {
-    x11(mode, &ids.iter().map(u32::to_string).collect::<Vec<_>>())
-}
-
-fn x11(mode: &str, args: &[String]) -> Vec<u32> {
-    let mut cmd = Command::new("python3");
-    cmd.arg("-c").arg(X11_WINDOWS_PY).arg(mode).arg(std::process::id().to_string()).args(args);
-    match cmd.output() {
-        Ok(out) => String::from_utf8_lossy(&out.stdout).split_whitespace().filter_map(|s| s.parse().ok()).collect(),
-        Err(_) => Vec::new(),
-    }
-}
-
-/// Assume control: everything else out of the way, on every workspace.
-fn take_over() {
-    let got = other_windows("minimize", &[]);
-    HIDDEN.lock().unwrap().extend(got);
-}
-
-/// Debt paid: bring back what we hid.
-fn give_back() {
-    let ids: Vec<u32> = std::mem::take(&mut *HIDDEN.lock().unwrap());
-    if !ids.is_empty() {
-        other_windows("restore", &ids);
-    }
-}
 const GYM_MONITOR: &str = "gym_monitor";
 const GYM_FULLSCREEN: &str = "gym_fullscreen";
 
@@ -67,59 +26,68 @@ fn remember(app: &AppHandle, key: &str, value: &str) {
     let _ = app.state::<Lifecycle>().core().store.set_setting(key, value);
 }
 
-/// Startup placement: main on the primary monitor, gym on its monitor.
+/// Startup: show the launcher (unless started in the background) and watch
+/// the gym window so wherever the user drags it is remembered.
 pub(crate) fn place(app: &AppHandle) {
-    if !app.state::<crate::Runtime>().enforces_windows() {
-        if !std::env::args().any(|a| a == "--background") { if let Some(main) = app.get_webview_window("main") { let _ = main.show(); } }
-        return;
+    if !std::env::args().any(|a| a == "--background") {
+        if let Some(main) = app.get_webview_window("main") { center_on_primary(&main); let _ = main.show(); }
     }
-    let (Some(main), Some(gym)) = (app.get_webview_window("main"), app.get_webview_window("gym")) else {
-        return;
-    };
-    let _ = main.show();
-    let _ = gym.show();
-    let monitors = main.available_monitors().unwrap_or_default();
-    let primary = main.primary_monitor().ok().flatten();
-    let names: Vec<&str> = monitors.iter().map(|m| m.name().map(String::as_str).unwrap_or("")).collect();
-    let primary_name = primary.as_ref().and_then(|p| p.name()).map(String::as_str).unwrap_or("");
-    let want = std::env::var("REPS_GYM_MONITOR").ok().or_else(|| Some(setting(app, GYM_MONITOR))).filter(|s| !s.is_empty());
-    // The gym display is in every view: every workspace, every mode.
-    let _ = gym.set_visible_on_all_workspaces(true);
-    let gym_at = pick_gym_monitor(&names, primary_name, want.as_deref());
-    match gym_at {
-        Some(i) => {
-            let _ = gym.set_position(Position::Physical(*monitors[i].position()));
-            if gym_wants_fullscreen(app) {
-                let _ = gym.set_fullscreen(true);
-            } else {
-                let _ = gym.maximize();
-            }
-        }
-        None => eprintln!("windows: no gym monitor (have {names:?}); gym stays a plain window"),
-    }
-    // The lock lives on whichever monitor the gym isn't — X's idea of
-    // "primary" may well be the gym TV.
-    let main_at = (0..monitors.len()).find(|i| Some(*i) != gym_at).map(|i| *monitors[i].position());
-    if let Some(pos) = main_at.or_else(|| primary.as_ref().map(|p| *p.position())) {
-        let _ = main.set_position(Position::Physical(pos));
-    }
-    // Dragged to another monitor: remember it and snap back to fullscreen there.
+    let Some(gym) = app.get_webview_window("gym") else { return };
     let handle = app.clone();
     let watched = gym.clone();
     gym.on_window_event(move |e| {
-        if !handle.state::<crate::Runtime>().enforces_windows() { return; }
         if let WindowEvent::Moved(_) = e {
             if let Ok(Some(m)) = watched.current_monitor() {
                 if let Some(name) = m.name() {
-                    if setting(&handle, GYM_MONITOR) != *name {
-                        remember(&handle, GYM_MONITOR, name);
-                        remember(&handle, GYM_FULLSCREEN, "1");
-                        let _ = watched.set_fullscreen(true);
-                    }
+                    if setting(&handle, GYM_MONITOR) != *name { remember(&handle, GYM_MONITOR, name); }
                 }
             }
         }
     });
+}
+
+/// Center a window on the primary monitor (`center()` can span the whole
+/// virtual desktop on multi-monitor X), shrinking it to fit.
+fn center_on_primary(w: &tauri::WebviewWindow) {
+    let _ = w.show(); // X ignores geometry set before the first map
+    let Some(m) = w.primary_monitor().ok().flatten().or_else(|| w.available_monitors().ok().and_then(|v| v.into_iter().next())) else { return };
+    let (pos, area, scale) = (m.position(), m.size(), m.scale_factor());
+    let width = ((960. * scale) as u32).min(area.width * 9 / 10);
+    let height = ((680. * scale) as u32).min(area.height * 9 / 10);
+    let _ = w.set_size(tauri::PhysicalSize { width, height });
+    let _ = w.set_position(Position::Physical(PhysicalPosition {
+        x: pos.x + (area.width - width) as i32 / 2, y: pos.y + (area.height - height) as i32 / 2 }));
+}
+
+/// Show the gym window on its monitor (remembered name, `$REPS_GYM_MONITOR`,
+/// else the first non-primary one), fullscreen unless F11'd out. With one
+/// display it stays a plain movable window: never cover the work screen.
+pub(crate) fn put_gym(app: &AppHandle) -> Option<usize> {
+    let gym = app.get_webview_window("gym")?;
+    let _ = gym.show();
+    // The gym display stays put on every workspace (it's on its own screen).
+    let _ = gym.set_visible_on_all_workspaces(true);
+    let monitors = gym.available_monitors().unwrap_or_default();
+    let primary = gym.primary_monitor().ok().flatten();
+    let names: Vec<&str> = monitors.iter().map(|m| m.name().map(String::as_str).unwrap_or("")).collect();
+    let primary_name = primary.as_ref().and_then(|p| p.name()).map(String::as_str).unwrap_or("");
+    let want = std::env::var("REPS_GYM_MONITOR").ok().or_else(|| Some(setting(app, GYM_MONITOR))).filter(|s| !s.is_empty());
+    let gym_at = pick_gym_monitor(&names, primary_name, want.as_deref());
+    match gym_at {
+        Some(i) => {
+            let _ = gym.set_position(Position::Physical(*monitors[i].position()));
+            if gym_wants_fullscreen(app) { let _ = gym.set_fullscreen(true); } else { let _ = gym.maximize(); }
+        }
+        None => eprintln!("windows: no gym monitor (have {names:?}); gym stays a plain window"),
+    }
+    gym_at
+}
+
+/// Forget where the gym window lives.
+pub(crate) fn reset_gym(app: &AppHandle) {
+    remember(app, GYM_MONITOR, "");
+    remember(app, GYM_FULLSCREEN, "");
+    if let Some(gym) = app.get_webview_window("gym") { let _ = gym.set_fullscreen(false); let _ = gym.center(); }
 }
 
 /// Fullscreen unless the user F11'd out of it (to drag it somewhere).
@@ -127,60 +95,45 @@ fn gym_wants_fullscreen(app: &AppHandle) -> bool {
     setting(app, GYM_FULLSCREEN) != "0"
 }
 
-/// Once a second: whatever un-fullscreened the gym display (a workspace
-/// switch, a stray key), put it back — unless the user F11'd out on purpose.
-pub(crate) fn assert_gym(app: &AppHandle) {
-    let _guard = WINDOW_ACTIONS.lock().unwrap();
-    if !app.state::<crate::Runtime>().enforces_windows() { return; }
-    let Some(gym) = app.get_webview_window("gym") else { return };
-    if gym_wants_fullscreen(app) && !gym.is_fullscreen().unwrap_or(true) {
-        let _ = gym.set_fullscreen(true);
-    }
+/// F11 / the on-screen button in the gym window: flip fullscreen and remember it.
+pub(crate) fn toggle_gym_fullscreen(app: &AppHandle) -> bool {
+    let Some(gym) = app.get_webview_window("gym") else { return false };
+    let on = !gym.is_fullscreen().unwrap_or(false);
+    remember(app, GYM_FULLSCREEN, if on { "1" } else { "0" });
+    let _ = gym.set_fullscreen(on);
+    on
 }
 
-/// Lock/unlock the programming monitor. Idempotent; safe from any thread.
-/// The gym window is never touched here.
-pub(crate) fn apply_lock(app: &AppHandle, locked: bool) {
-    let _guard = WINDOW_ACTIONS.lock().unwrap();
-    if !app.state::<crate::Runtime>().enforces_windows() { return; }
-    if LOCKED.swap(locked, Ordering::SeqCst) == locked {
-        return;
+/// Show the reminder, centered on the first display that isn't the gym's
+/// (the only display when there is one). Asks for attention once; never
+/// forces focus. Visible on every workspace where the WM allows it.
+pub(crate) fn show_prompt(app: &AppHandle) {
+    let Some(prompt) = app.get_webview_window("prompt") else { return };
+    let gym_monitor = app.get_webview_window("gym")
+        .filter(|g| g.is_visible().unwrap_or(false))
+        .and_then(|g| g.current_monitor().ok().flatten())
+        .and_then(|m| m.name().cloned());
+    let _ = prompt.set_always_on_top(true);
+    let _ = prompt.set_visible_on_all_workspaces(true);
+    let _ = prompt.show(); // X ignores geometry set before the first map
+    let monitors = prompt.available_monitors().unwrap_or_default();
+    let target = monitors.iter().find(|m| m.name().cloned() != gym_monitor).or(monitors.first());
+    if let Some(m) = target {
+        let (pos, area, scale) = (m.position(), m.size(), m.scale_factor());
+        let (w, h) = ((500. * scale) as i32, (360. * scale) as i32);
+        let x = pos.x + (area.width as i32 - w).max(0) / 2;
+        let y = pos.y + (area.height as i32 - h).max(0) / 2;
+        let _ = prompt.set_position(Position::Physical(PhysicalPosition { x, y }));
     }
-    let Some(main) = app.get_webview_window("main") else { return };
-    let _ = main.set_decorations(!locked);
-    let _ = main.set_fullscreen(locked);
-    let _ = main.set_always_on_top(locked);
-    // Sticky across virtual desktops: Ctrl+Alt+←/→ must not walk away from it.
-    let _ = main.set_visible_on_all_workspaces(locked);
-    if locked {
-        take_over();
-        let _ = main.unminimize();
-        let _ = main.set_focus();
-    } else {
-        // Debt paid: give the desktop back.
-        let _ = main.minimize();
-        give_back();
-    }
+    let _ = prompt.request_user_attention(Some(tauri::UserAttentionType::Informational));
 }
 
-/// Take over the view: once a second while locked, un-minimize, raise and
-/// focus the lock window — whichever workspace or app the user wandered to.
-pub(crate) fn refocus(app: &AppHandle) {
-    let _guard = WINDOW_ACTIONS.lock().unwrap();
-    if !app.state::<crate::Runtime>().enforces_windows() { return; }
-    if !LOCKED.load(Ordering::SeqCst) {
-        return;
-    }
-    take_over();
-    if let Some(main) = app.get_webview_window("main") {
-        let _ = main.unminimize();
-        let _ = main.set_fullscreen(true);
-        let _ = main.set_always_on_top(true);
-        let _ = main.set_focus();
-        // GTK's focus request loses to focus-stealing prevention once the
-        // user has minimized us; a pager-sourced _NET_ACTIVE_WINDOW doesn't.
-        x11("activate", &[main.title().unwrap_or_default()]);
-    }
+pub(crate) fn hide_prompt(app: &AppHandle) {
+    if let Some(prompt) = app.get_webview_window("prompt") { let _ = prompt.hide(); }
+}
+
+pub(crate) fn show_main(app: &AppHandle) {
+    if let Some(main) = app.get_webview_window("main") { if !main.is_visible().unwrap_or(true) { center_on_primary(&main); } let _ = main.show(); let _ = main.unminimize(); let _ = main.set_focus(); }
 }
 
 #[cfg(test)]
@@ -198,17 +151,3 @@ mod tests {
     }
 }
 
-/// Release only windows this process hid; never minimize unrelated windows here.
-pub(crate) fn release(app: &AppHandle) {
-    let _guard = WINDOW_ACTIONS.lock().unwrap();
-    LOCKED.store(false, Ordering::SeqCst);
-    for label in ["main", "gym"] {
-        if let Some(window) = app.get_webview_window(label) {
-            let _ = window.set_fullscreen(false);
-            let _ = window.set_always_on_top(false);
-            let _ = window.set_visible_on_all_workspaces(false);
-            let _ = window.set_decorations(false);
-        }
-    }
-    give_back();
-}

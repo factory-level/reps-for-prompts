@@ -31,6 +31,8 @@ pub struct Prescription {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Phase {
+    /// No workout session: nothing counts down, nothing reminds.
+    Idle,
     Coding,
     ExerciseRequired,
     WorkoutActive,
@@ -93,6 +95,9 @@ pub struct Snapshot {
     pub pointer: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub day: Option<DayPlan>,
+    /// The session is paused: the countdown is frozen and nothing reminds.
+    #[serde(default)]
+    pub paused: bool,
 }
 
 #[cfg(test)]
@@ -117,6 +122,7 @@ mod tests {
             rotation: vec!["bench".into()],
             pointer: 0,
             day: None,
+            paused: false,
         };
         let v: serde_json::Value = serde_json::to_value(&snap).unwrap();
         assert!(v.get("remainingSeconds").is_some());

@@ -1,5 +1,5 @@
-use std::sync::{Mutex, atomic::Ordering};
-use engine::{activity::{AgentPresence, detect}, clock::{Clock, SystemClock}, types::Phase};
+use std::sync::Mutex;
+use engine::activity::AgentPresence;
 use serde::Serialize;
 use tauri::{AppHandle, Manager};
 use crate::{Lifecycle, Runtime};
@@ -16,7 +16,7 @@ pub fn daily_status(app: AppHandle) -> Status {
     let daily = app.state::<SharedDaily>(); let daily = daily.lock().unwrap();
     Status { workday_end:core.store.setting("workday_end","18:00"), warn_minutes:core.store.setting("workday_warn_minutes","60").parse().unwrap_or(60), last_day_warning:core.store.setting("last_day_warning",""), checked_at: daily.checked_at, agents: daily.agents.clone(), snooze_until: daily.snooze_until,
         work_minutes: core.store.setting("work_minutes", "25").parse().unwrap_or(25.),
-        lock_mode: app.state::<Runtime>().lock_mode.load(Ordering::SeqCst),
+        lock_mode: false,
         sync: core.store.setting("sync_status", "Not configured") }
 }
 
@@ -31,19 +31,17 @@ pub fn reminder_action(app: AppHandle, action: String, minutes: Option<u32>) -> 
     // The tick loop reads the snooze from Daily; the lifecycle stored it.
     let snooze_until = life.core().store.setting("snooze_until", "0").parse().unwrap_or(0.);
     app.state::<SharedDaily>().lock().unwrap().snooze_until = snooze_until;
-    if action != "start" { crate::windows::release(&app); }
     Ok(())
 }
 
-pub fn save_daily_settings(app: AppHandle, minutes: u32, lock_mode: bool) -> Result<(), String> {
+/// The coding interval lives in the training plan (Configure Workout).
+pub fn save_daily_settings(app: AppHandle, minutes: u32) -> Result<(), String> {
     if !(1..=240).contains(&minutes) { return Err("Interval must be 1–240 minutes".into()); }
-    let life = app.state::<Lifecycle>(); let mut core = life.core();
-    if core.session.snapshot(SystemClock.now()).phase != Phase::Coding { return Err("Change settings between workouts".into()); }
-    core.store.set_setting("work_minutes", &minutes.to_string()).map_err(|e| e.to_string())?;
-    core.store.set_setting("lock_mode", if lock_mode { "1" } else { "0" }).map_err(|e| e.to_string())?;
-    core.session.configure_timer(minutes as f64, SystemClock.now());
-    app.state::<Runtime>().lock_mode.store(lock_mode, Ordering::SeqCst);
-    drop(core); if !lock_mode { crate::windows::release(&app); } Ok(())
+    let home = app.state::<Runtime>().session_home.clone();
+    let mut plan = crate::training::load(&home, crate::ROUTINE_JSON);
+    plan.coding_minutes = minutes as f64;
+    crate::training::save(&home, &plan)?;
+    app.state::<Lifecycle>().core().store.set_setting("work_minutes", &minutes.to_string()).map_err(|e| e.to_string())
 }
 
 /// Flock is held for the process lifetime; stale files cannot block restarts.
@@ -55,31 +53,14 @@ pub fn instance_lock(home: &std::path::Path) -> Result<std::fs::File, String> {
     Ok(file)
 }
 
-pub fn refresh(daily: &mut Daily) {
-    let agents = detect();
-    if daily.checked_at == 0. || agents.codex != daily.agents.codex || agents.claude != daily.agents.claude {
-        eprintln!("[RFP WATCHER] Codex={} Claude Code={} (same-user process check; rfp inspect for countdown)", agents.codex, agents.claude);
-    }
-    daily.agents = agents;
-    daily.checked_at = SystemClock.now();
-}
-
+/// `rfp routine`: the training plan JSON (plan.json).
 pub fn routine_settings(app:AppHandle) -> Result<String,String> {
-    let path=app.state::<Runtime>().session_home.join("routine.json");
-    match std::fs::read_to_string(path){Ok(s)=>Ok(s),Err(e) if e.kind()==std::io::ErrorKind::NotFound=>Ok(crate::ROUTINE_JSON.into()),Err(e)=>Err(e.to_string())}
+    let plan=crate::training::load(&app.state::<Runtime>().session_home,crate::ROUTINE_JSON);
+    serde_json::to_string(&plan).map_err(|e|e.to_string())
 }
 pub fn save_routine(app:AppHandle,json:String)->Result<(),String>{
-    let life=app.state::<Lifecycle>();let mut core=life.core();
-    if core.session.snapshot(SystemClock.now()).phase!=Phase::Coding{return Err("Change routine between workouts".into());}
-    let mut plan=engine::plan::DailyPlan::from_routine_json(&json,&SystemClock.today())?;
-    if let Some(current)=core.session.plan(){
-        let d=current.to_day_plan();
-        plan.restore(&SystemClock.today(),&d.items.iter().map(|i|(i.name.clone(),i.done)).collect::<Vec<_>>());
-    }
-    let home=&app.state::<Runtime>().session_home;
-    std::fs::write(home.join("routine.json.tmp"),&json).map_err(|e|e.to_string())?;
-    std::fs::rename(home.join("routine.json.tmp"),home.join("routine.json")).map_err(|e|e.to_string())?;
-    core.session.set_plan(plan);Ok(())
+    let plan:crate::training::TrainingPlan=serde_json::from_str(&json).map_err(|e|format!("plan.json: {e}"))?;
+    crate::training::save(&app.state::<Runtime>().session_home,&plan)
 }
 
 #[cfg(test)] mod tests {

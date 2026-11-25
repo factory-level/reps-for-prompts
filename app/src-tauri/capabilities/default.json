@@ -1,12 +1,14 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the main and gym windows",
+  "description": "Capability for the launcher, gym and prompt windows",
   "windows": [
     "main",
-    "gym"
+    "gym",
+    "prompt"
   ],
   "permissions": [
-    "core:default"
+    "core:default",
+    "core:window:allow-start-dragging"
   ]
 }

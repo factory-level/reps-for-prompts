@@ -1,25 +1,47 @@
-import {render,screen,waitFor,cleanup} from '@testing-library/react';
-import {afterEach,describe,it,expect,vi} from 'vitest';
-import App from './App';
-const mock=vi.hoisted(()=>({mode:'workout',view:'screen',phase:'WEIGHT_CONFIRMATION',notice:null as string|null}));
-vi.mock('@tauri-apps/api/core',()=>({invoke:vi.fn((name:string)=>Promise.resolve(name==='get_app_mode'?mock.mode:{view:mock.view,previewOnly:true,lastError:null,notice:mock.notice,vision:{state:'available'}}))}));
-vi.mock('@tauri-apps/api/event',()=>({listen:vi.fn(()=>Promise.resolve(()=>{}))}));
-vi.mock('./useSnapshot',()=>({useSnapshot:()=>({phase:mock.phase,remainingSeconds:60,prescription:{exercise:'squat',kind:'REP',targetReps:5,targetSeconds:0,defaultWeight:0},progress:null,capacityUsed:0,capacityLimit:20,rotation:[],pointer:0})}));
-afterEach(()=>{cleanup();mock.notice=null;});
-describe('Minimal workout controls',()=>{
- it('shows the end-of-day warning alongside start',async()=>{
-  Object.assign(mock,{mode:'workout',view:'screen',phase:'EXERCISE_REQUIRED',notice:'Your workday is ending soon. Start when ready: rfp start'});
-  const {container}=render(<App/>);
-  expect(await screen.findByRole('status')).toHaveTextContent('Your workday is ending soon');
-  expect(screen.getByRole('button',{name:'Start workout'})).toBeInTheDocument();
-  expect(container.querySelectorAll('button,input,a')).toHaveLength(1);
- });
- for(const [mode,view,phase] of [['workout','screen','WEIGHT_CONFIRMATION'],['debug','screen','WORKOUT_ACTIVE'],['debug','camera','CODING'],['debug','video','CODING']]){
-  it(`${mode}/${view} only exposes applicable workout controls`,async()=>{
-   Object.assign(mock,{mode,view,phase});const {container}=render(<App/>);
-   await waitFor(()=>expect(screen.queryByText('Connecting to RFP…')).not.toBeInTheDocument());
-   expect(container.querySelectorAll('button,input,select,textarea,a,summary,[tabindex]')).toHaveLength(phase==='WEIGHT_CONFIRMATION'?2:0);
-   if(phase==='WEIGHT_CONFIRMATION')expect(screen.getByText('rfp finish --weight 0')).toBeInTheDocument();
+import { invoke } from "@tauri-apps/api/core";
+import { fireEvent, render, screen } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
+import App from "./App";
+import { app, base } from "./fixtures";
+
+const mock = vi.hoisted(() => ({ phase: "IDLE" as string, setup: false }));
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn((name: string) => Promise.resolve(name === "get_display_state" ? { view: "screen", previewOnly: false, lastError: null } : undefined)) }));
+vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(() => Promise.resolve(() => {})) }));
+vi.mock("./useSnapshot", () => ({ useSnapshot: () => ({ ...base, phase: mock.phase }) }));
+vi.mock("./useAppState", () => ({ useAppState: () => ({ ...app, routine: null, setup: mock.setup }) }));
+
+describe("launcher", () => {
+  it("is two illustrated actions and a cog, nothing else (UI-01)", () => {
+    Object.assign(mock, { phase: "IDLE", setup: false });
+    const { container } = render(<App forceRole="main" />);
+    expect(screen.getByRole("button", { name: /Start workout/ })).toHaveTextContent("Next: Lower A");
+    expect(screen.getByRole("button", { name: /Configure workout/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Settings" })).toBeInTheDocument();
+    expect(container.querySelectorAll("button")).toHaveLength(3);
+    expect(container.querySelector("svg, img, canvas[aria-label*=chart]")).not.toBeNull();
   });
- }
+  it("Start prepares the monitor; a live session reads Resume", () => {
+    Object.assign(mock, { phase: "IDLE", setup: false });
+    const { unmount } = render(<App forceRole="main" />);
+    fireEvent.click(screen.getByRole("button", { name: /Start workout/ }));
+    expect(invoke).toHaveBeenCalledWith("prepare_workout");
+    unmount();
+    Object.assign(mock, { phase: "CODING" });
+    render(<App forceRole="main" />);
+    expect(screen.getByRole("button", { name: /Resume workout/ })).toBeInTheDocument();
+  });
+  it("setup can start the session from the work desktop", () => {
+    Object.assign(mock, { phase: "IDLE", setup: true });
+    render(<App forceRole="main" />);
+    fireEvent.click(screen.getByRole("button", { name: "Start session" }));
+    expect(invoke).toHaveBeenCalledWith("start_session");
+  });
+  it("routes the gym and prompt windows", () => {
+    Object.assign(mock, { phase: "CODING", setup: false });
+    const { unmount } = render(<App forceRole="gym" />);
+    expect(screen.getByText("CODE")).toBeInTheDocument();
+    unmount();
+    render(<App forceRole="prompt" />);
+    expect(screen.getByText("Nothing due right now.")).toBeInTheDocument();
+  });
 });

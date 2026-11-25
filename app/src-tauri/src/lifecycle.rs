@@ -16,7 +16,8 @@ use serde_json::{json, Value};
 use crate::detector::{self, DetectorInputs, HonorReason};
 use crate::hub::{enable_on_hub, wire_events, SharedHub, APP_ID, WORKOUT_METRIC};
 use crate::vision_status::{Signal, Vision, VisionStatus};
-use crate::{Core, PlanState};
+use crate::{Active, Core, PlanState};
+use crate::training;
 
 /// The outbound seam. `TauriEffects` is the desktop adapter; tests record.
 pub trait Effects: Send + Sync {
@@ -55,10 +56,8 @@ pub struct Tick {
     pub defer: f64,
     /// The coding period ends now: a snooze ran out, or the workday warning fired.
     pub expire: bool,
-    /// Reminders may fire: an agent is at work and nothing is snoozed.
+    /// Reminders may fire: nothing is snoozed.
     pub remind: bool,
-    /// Lock mode: a lock starts its set without waiting for `start`.
-    pub auto_start: bool,
 }
 
 #[derive(Clone)]
@@ -87,7 +86,10 @@ impl std::ops::Deref for Lifecycle {
 
 /// The coding interval the timer returns to after a break.
 fn work_minutes(core: &Core) -> f64 {
-    core.store.setting("work_minutes", "25").parse().unwrap_or(25.)
+    // REPS_WORK_MINUTES overrides for demos and tests (0.1 = a 6s interval).
+    std::env::var("REPS_WORK_MINUTES").ok().and_then(|v| v.parse().ok())
+        .or(core.active.as_ref().map(|a| a.coding_minutes))
+        .unwrap_or_else(|| core.store.setting("work_minutes", "25").parse().unwrap_or(25.))
 }
 
 fn new_session_id() -> String {
@@ -156,7 +158,11 @@ impl Lifecycle {
     /// turned the camera off by hand, and one that forgot to.)
     fn apply(&self, core: &mut Core, now: f64, was_active: bool, facts: &[Fact]) -> Snapshot {
         self.publish_facts(facts);
-        let snapshot = persist_and_snapshot(core, now);
+        let mut snapshot = persist_and_snapshot(core, now);
+        if facts.contains(&Fact::RoutineCompleted) {
+            complete_routine(core, &self.clock.today());
+            snapshot = core.session.snapshot(now);
+        }
         // Honor completion and a satisfied target both leave WorkoutActive.
         let left_active = was_active && snapshot.phase != Phase::WorkoutActive;
         if facts.contains(&Fact::Started) {
@@ -192,7 +198,82 @@ impl Lifecycle {
     /// The app is up: the coding timer starts now — there is no "start"
     /// button. Debug mode stays idle until a debug set is started.
     pub fn begin(&self) {
-        if !self.debug { let _ = self.step(|core, now, today| Ok(core.session.start(now, today))); }
+        if self.debug { return; }
+        // A session left by a crash or restart comes back paused, camera off.
+        let _ = self.step(|core, now, today| {
+            if core.active.is_none() { return Err("idle".into()); }
+            core.session.configure_timer(work_minutes(core), now);
+            let facts = core.session.start(now, today);
+            core.session.pause(now)?;
+            Ok(facts)
+        });
+    }
+
+    /// Start Session: run the next routine of the cycle from a fresh coding
+    /// interval. One session at a time; a second call is rejected.
+    pub fn start_session(&self) -> Result<Snapshot, String> {
+        if self.debug { return Err("Switch to Workout mode first".into()); }
+        self.preview_off();
+        self.step(|core, now, today| {
+            if core.session.snapshot(now).phase != Phase::Idle { return Err("A workout is already under way".into()); }
+            let plan = training::load(&core.home, crate::ROUTINE_JSON);
+            let (index, slot, routine) = training::next(&plan).ok_or("Configure a training plan first")?;
+            let daily = engine::plan::DailyPlan::from_routine_json(&training::routine_json(routine), today)?;
+            let active = Active {
+                id: format!("wo-{}", uuid::Uuid::new_v4()), routine_id: routine.id.clone(), routine_name: routine.name.clone(),
+                slot_id: slot.slot_id.clone(), slot_index: index, slot_count: plan.cycle.len(), coding_minutes: plan.coding_minutes,
+            };
+            core.store.insert_workout(&active.id, &active.routine_id, &active.routine_name, &active.slot_id, today).map_err(|e| e.to_string())?;
+            core.store.set_setting("active_workout", &serde_json::to_string(&active).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+            let _ = core.store.set_setting("snooze_until", "0");
+            core.session.set_plan(daily);
+            core.active = Some(active);
+            core.last_completed = None;
+            core.session.configure_timer(work_minutes(core), now);
+            Ok(core.session.start(now, today))
+        })
+    }
+
+    /// End the session early: confirmed sets stay, the cycle does not move.
+    pub fn end_workout(&self) -> Snapshot {
+        self.preview_off();
+        self.step(|core, now, today| {
+            let done = core.session.snapshot(now).day.map(|d| d.sets_done).unwrap_or(0);
+            let facts = core.session.end();
+            if let Some(active) = core.active.take() {
+                let _ = core.store.finish_workout(&active.id, if done > 0 { "partial" } else { "canceled" }, today);
+                let _ = core.store.set_setting("active_workout", "");
+            }
+            Ok(facts)
+        }).unwrap_or_else(|_| self.snapshot())
+    }
+
+    pub fn pause(&self) -> Result<Snapshot, String> {
+        self.step(|core, now, _| { core.session.pause(now)?; Ok(vec![]) })
+    }
+
+    pub fn resume(&self) -> Result<Snapshot, String> {
+        self.step(|core, now, _| { core.session.resume(now); Ok(vec![]) })
+    }
+
+    /// Manual completion: the camera didn't (or can't) see it, the user says
+    /// it's done. Rep sets go on to confirmation, where actual values are typed.
+    pub fn manual_finish(&self) -> Result<Snapshot, String> {
+        self.step(|core, now, _| {
+            if core.session.snapshot(now).phase != Phase::WorkoutActive { return Err("No set is under way".into()); }
+            Ok(core.session.honor_complete())
+        })
+    }
+
+    /// Save the set with its actual reps and lbs. Commits once: a second
+    /// call (another window, a retry) finds no confirmation pending.
+    pub fn confirm_set(&self, weight: f64, reps: Option<u32>) -> Result<Snapshot, String> {
+        if !weight.is_finite() || !(0.0..=100000.0).contains(&weight) { return Err("Enter a weight from 0 to 100000 lb".into()); }
+        if reps.is_some_and(|r| r == 0 || r > 10000) { return Err("Reps must be 1 or more".into()); }
+        self.step(|core, now, today| {
+            if core.session.snapshot(now).phase != Phase::WeightConfirmation { return Err("This set was already saved".into()); }
+            Ok(core.session.confirm_weight(weight, reps, today))
+        })
     }
 
     /// Once a second: run the coding timer, lock when it expires, and return
@@ -204,7 +285,6 @@ impl Lifecycle {
         if tick.expire { core.session.configure_timer(0., now); }
         let mut facts = if !self.debug && tick.remind { core.session.tick(now, today) } else { vec![] };
         let locked = !facts.is_empty();
-        if locked && tick.auto_start { facts.extend(core.session.start_workout(today)); }
         // The "LOGGED" beat: 3s in UNLOCKED, then CODE.
         let unlocked = !self.debug && core.session.snapshot(now).phase == Phase::Unlocked;
         let beat_over = {
@@ -216,8 +296,10 @@ impl Lifecycle {
         };
         if beat_over {
             facts.extend(core.session.resume_coding(now));
-            let minutes = work_minutes(&core);
-            core.session.configure_timer(minutes, now);
+            if core.session.snapshot(now).phase == Phase::Coding {
+                let minutes = work_minutes(&core);
+                core.session.configure_timer(minutes, now);
+            }
         }
         // Most ticks change nothing durable: only the countdown moves.
         let snapshot = if facts.is_empty() { core.session.snapshot(now) } else { self.apply(&mut core, now, false, &facts) };
@@ -260,8 +342,8 @@ impl Lifecycle {
                 return Err("Finish or stop the current workout first".into());
             }
             let until = match snooze_minutes {
-                Some(minutes) if [5, 15, 30].contains(&minutes) => now + minutes as f64 * 60.,
-                Some(_) => return Err("Choose 5, 15, or 30 minutes".into()),
+                Some(minutes) if (1..=60).contains(&minutes) => now + minutes as f64 * 60.,
+                Some(_) => return Err("Choose 1 to 60 minutes".into()),
                 None => 0.,
             };
             core.store.set_setting("snooze_until", &until.to_string()).map_err(|e| e.to_string())?;
@@ -323,7 +405,7 @@ impl Lifecycle {
             }
             // Each is a no-op outside its phase.
             let mut facts = core.session.honor_complete();
-            facts.extend(core.session.confirm_weight(weight, today));
+            facts.extend(core.session.confirm_weight(weight, None, today));
             Ok(facts)
         })
     }
@@ -550,10 +632,23 @@ impl Lifecycle {
     }
 }
 
+/// The routine's last set was saved: close the session as completed and move
+/// the cycle on, exactly once (the session can only be closed while active).
+fn complete_routine(core: &mut Core, today: &str) {
+    let Some(active) = core.active.take() else { return };
+    if core.store.finish_workout(&active.id, "completed", today).unwrap_or(false) {
+        let mut plan = training::load(&core.home, crate::ROUTINE_JSON);
+        training::advance(&mut plan, &active.slot_id);
+        if let Err(error) = training::save(&core.home, &plan) { eprintln!("could not advance the cycle: {error}"); }
+    }
+    let _ = core.store.set_setting("active_workout", "");
+    core.last_completed = Some(active.routine_name);
+}
+
 pub(crate) fn persist_and_snapshot(core: &mut Core, now: f64) -> Snapshot {
     if let Some(rec) = core.session.take_pending_record() {
         match core.store.record_set(&rec) {
-            Ok(()) => {}
+            Ok(()) => if let Some(active) = &core.active { let _ = core.store.tag_last_set(&active.id); },
             Err(e) => eprintln!("failed to record set: {e}"),
         }
     }
@@ -649,7 +744,9 @@ mod tests {
         );
         session.set_plan(engine::plan::DailyPlan::from_routine_json(routine, DAY).unwrap());
         let _ = session.start(1000.0, DAY);
-        let core = Core { session, store: Store::open(std::path::Path::new(":memory:")).unwrap() };
+        let home = std::env::temp_dir().join(format!("rfp-life-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home).unwrap();
+        let core = Core { session, store: Store::open(std::path::Path::new(":memory:")).unwrap(), home, active: None, last_completed: None };
         let calls = hub.as_ref().map(|hub| hub.calls.clone()).unwrap_or_default();
         let hub: SharedHub = Arc::new(Mutex::new(hub.map(|hub| Box::new(hub) as Box<dyn hub_client::VisionHub>)));
         let effects = Recording::default();
@@ -824,7 +921,7 @@ mod tests {
     fn snooze_unlocks_with_its_reason_and_reminds_at_expiry() {
         let rig = rig(LIFTS, Some(FakeHub::new(vec![])), false);
         assert_eq!(lock(&rig).phase, Phase::ExerciseRequired);
-        assert_eq!(rig.life.snooze(7).unwrap_err(), "Choose 5, 15, or 30 minutes");
+        assert_eq!(rig.life.snooze(61).unwrap_err(), "Choose 1 to 60 minutes");
 
         let snapshot = rig.life.snooze(15).unwrap();
         assert_eq!(snapshot.phase, Phase::Coding);
@@ -1029,7 +1126,7 @@ mod tests {
         let history = rig.life.core().store.history(10).unwrap();
         assert_eq!((history[0].exercise.as_str(), history[0].seconds, history[0].verified), ("jumprope", 60.0, true));
         assert_eq!(rig.types(), [&LOCK[..], &[
-            "detector_started", "workout_completed", "desktop_unlocked", "detector_stopped",
+            "detector_started", "workout_completed", "desktop_unlocked", "routine_completed", "detector_stopped",
         ]].concat());
     }
 
@@ -1082,14 +1179,75 @@ mod tests {
         assert!(tick(&rig, 1.0, Tick { expire: true, ..reminding() }).1);
     }
 
-    #[test]
-    fn in_lock_mode_the_lock_starts_the_set() {
+    /// V2: an idle app, a two-routine cycle, one full session.
+    fn v2_rig() -> Rig {
         let rig = rig(LIFTS, Some(FakeHub::new(vec![])), false);
-        let (snapshot, locked) = tick(&rig, 1500.0, Tick { auto_start: true, ..reminding() });
-        assert!(locked);
-        assert_eq!(snapshot.phase, Phase::WorkoutActive);
-        assert!(rig.active());
-        assert_eq!(rig.types(), [&LOCK[..], &["detector_started"]].concat());
+        let _ = rig.life.end_workout(); // the rig starts mid-routine; V2 starts idle
+        let home = rig.life.core().home.clone();
+        let mut plan = training::seed(r#"{"name":"Upper A","lifts":[{"exercise":"squat","sets":2,"reps":5}]}"#);
+        let mut lower = plan.routines[0].clone(); lower.id = "routine-2".into(); lower.name = "Lower A".into();
+        plan.routines.push(lower);
+        plan.cycle.push(training::Slot { slot_id: "slot-2".into(), routine_id: "routine-2".into() });
+        training::save(&home, &plan).unwrap();
+        rig
+    }
+
+    fn do_set(rig: &Rig, weight: f64) -> Result<Snapshot, String> {
+        start(rig);
+        rig.life.manual_finish().unwrap();
+        rig.life.confirm_set(weight, Some(5))
+    }
+
+    #[test]
+    fn a_full_session_completes_once_and_advances_the_cycle() {
+        let rig = v2_rig();
+        assert_eq!(rig.life.snapshot().phase, Phase::Idle);
+        assert_eq!(rig.life.start_session().unwrap().phase, Phase::Coding);
+        assert!(rig.life.start_session().is_err()); // one session at a time
+        do_set(&rig, 35.5).unwrap();
+        assert!(rig.life.confirm_set(35.5, None).is_err()); // a second save commits nothing
+        tick(&rig, 1.0, reminding());
+        tick(&rig, 3.0, reminding()); // the LOGGED beat, then the next interval
+        assert_eq!(rig.life.snapshot().phase, Phase::Coding);
+        do_set(&rig, 40.0).unwrap();
+        let home = rig.life.core().home.clone();
+        let core = rig.life.core();
+        assert!(core.active.is_none());
+        assert_eq!(core.last_completed.as_deref(), Some("Upper A"));
+        let workouts = core.store.workouts_between("0000-01-01", "9999-12-31").unwrap();
+        assert_eq!((workouts.len(), workouts[0]["status"].as_str(), workouts[0]["sets"].as_i64()), (1, Some("completed"), Some(2)));
+        drop(core);
+        assert_eq!(training::load(&home, crate::ROUTINE_JSON).next_slot, "slot-2");
+        tick(&rig, 1.0, reminding());
+        tick(&rig, 3.0, reminding());
+        assert_eq!(rig.life.snapshot().phase, Phase::Idle);
+        assert_eq!(rig.life.core().store.history(10).unwrap()[0].weight, 40.0);
+    }
+
+    #[test]
+    fn ending_early_keeps_sets_without_credit_or_cycle_advance() {
+        let rig = v2_rig();
+        rig.life.start_session().unwrap();
+        do_set(&rig, 35.0).unwrap();
+        let snapshot = rig.life.end_workout();
+        assert_eq!(snapshot.phase, Phase::Idle);
+        let core = rig.life.core();
+        let workouts = core.store.workouts_between("0000-01-01", "9999-12-31").unwrap();
+        assert_eq!(workouts.last().unwrap()["status"], "partial");
+        assert_eq!(core.store.history(10).unwrap().len(), 1);
+        assert_eq!(training::load(&core.home, crate::ROUTINE_JSON).next_slot, "slot-1");
+        assert!(!rig.active());
+    }
+
+    #[test]
+    fn pause_freezes_reminders_until_resumed() {
+        let rig = v2_rig();
+        rig.life.start_session().unwrap();
+        rig.life.pause().unwrap();
+        let (snapshot, locked) = tick(&rig, 5000.0, reminding());
+        assert!(!locked && snapshot.paused);
+        rig.life.resume().unwrap();
+        assert!(tick(&rig, 1500.0, reminding()).1);
     }
 
     #[test]

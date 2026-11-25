@@ -1,3 +1,5 @@
+> **Superseded (2026-11-23)** by the V2 design, "annoy me, don't imprison me": no lock, no takeover of other apps, no workout debt. As built: `docs/architecture/v2-desktop.md`.
+
 # Vision MCP — Workout Debt Desktop Frontend Tech Spec
 
 **Date:** 2026-08-31
