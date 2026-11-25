@@ -65,6 +65,8 @@ fn center_on_primary(w: &tauri::WebviewWindow) {
 pub(crate) fn put_gym(app: &AppHandle) -> Option<usize> {
     let gym = app.get_webview_window("gym")?;
     let _ = gym.show();
+    // The gym display stays put on every workspace (it's on its own screen).
+    let _ = gym.set_visible_on_all_workspaces(true);
     let monitors = gym.available_monitors().unwrap_or_default();
     let primary = gym.primary_monitor().ok().flatten();
     let names: Vec<&str> = monitors.iter().map(|m| m.name().map(String::as_str).unwrap_or("")).collect();
