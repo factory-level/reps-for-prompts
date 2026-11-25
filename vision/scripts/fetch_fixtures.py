@@ -83,7 +83,9 @@ def main() -> None:
         else:
             print(f"downloading {clip['file']} ...")
             req = urllib.request.Request(
-                clip["url"], headers={"User-Agent": "rfp/0.1 test fixtures"}
+                # Wikimedia throttles (HTTP 429) user agents that do not identify
+                # the project with a URL: https://meta.wikimedia.org/wiki/User-Agent_policy
+                clip["url"], headers={"User-Agent": "rfp-fixtures/0.1 (https://github.com/factory-level/reps-for-prompts)"}
             )
             for attempt in range(5):
                 try:
