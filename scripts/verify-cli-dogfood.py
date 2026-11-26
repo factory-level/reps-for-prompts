@@ -17,7 +17,9 @@ for _ in range(40):
     initial=run('status').get('runtime')
     if initial:break
     time.sleep(.25)
-assert initial and initial['snapshot']['phase']=='CODING',initial
+# V2 rests in IDLE until a session starts; pre-V2 builds rest in CODING.
+resting=initial and initial['snapshot']['phase']
+assert resting in ('IDLE','CODING'),initial
 try:
     debug=run('mode','debug');assert debug['mode']=='debug',debug
     assert run('debug','exercises')
@@ -53,7 +55,7 @@ try:
     camera=run('camera','status')
     print('Camera preview:',json.dumps(camera))
     assert camera['camera']=='open' and camera['display']['framesSeen']>0,camera
-    assert run('status')['runtime']['snapshot']['phase']=='CODING'
+    assert run('status')['runtime']['snapshot']['phase'] in ('IDLE','CODING') # preview never starts a workout
     assert len(run('debug','history')['records'])==1
     run('camera','stop')
     run('display','--window','main','--visible','on')

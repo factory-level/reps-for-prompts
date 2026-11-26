@@ -33,8 +33,10 @@ Both honor `PORT` / `DEBUG_PORT` if their defaults are taken.
 
 ## Automated — installed build (needs `install-dogfood.py` and a webcam)
 
-Requires `rfp.service` running and idle (`rfp status` → phase `CODING`, with a
-few minutes left on the timer). `rfp cancel` is the no-credit escape if the
+Requires `rfp.service` running and idle (`rfp status` → phase `IDLE` on V2,
+or `CODING` with a few minutes left on pre-V2 builds). Pre-V2, after the
+workday warning lead (17:00 by default) the session goes straight to
+`EXERCISE_REQUIRED`; run `rfp workday --end 23:59` first and restore it after. `rfp cancel` is the no-credit escape if the
 workout screen appears mid-run.
 
 - [ ] `python3 scripts/verify-cli-dogfood.py` → both `PASS:` lines. Opens the
@@ -44,7 +46,9 @@ workout screen appears mid-run.
       (the installed hub's debug listener is local and unauthenticated)
 - [ ] `python3 scripts/verify-passive.py` → snooze survives restart, zero credit
 - [ ] `python3 scripts/verify-daemon.py` → run **last**; it stops and restarts
-      `rfp.service`
+      `rfp.service`. **Fails on V2 builds:** V2 removed the agent watcher and the
+      end-of-day warning this script exercises (`rfp inspect` always reports
+      `stale`). Passes on pre-V2 builds.
 - [ ] Read-only surfaces: `rfp inspect`, `rfp site`, `rfp profile`,
       `rfp status --source remote`, `rfp summary`
 
