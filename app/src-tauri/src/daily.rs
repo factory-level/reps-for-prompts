@@ -1,5 +1,6 @@
 use std::sync::Mutex;
-use engine::activity::AgentPresence;
+use engine::activity::{detect, AgentPresence};
+use engine::clock::{Clock, SystemClock};
 use serde::Serialize;
 use tauri::{AppHandle, Manager};
 use crate::{Lifecycle, Runtime};
@@ -18,6 +19,17 @@ pub fn daily_status(app: AppHandle) -> Status {
         work_minutes: core.store.setting("work_minutes", "25").parse().unwrap_or(25.),
         lock_mode: false,
         sync: core.store.setting("sync_status", "Not configured") }
+}
+
+/// Sample which coding agents are open (same-user process check); the tick
+/// loop calls this every 5 s. Logs only when presence changes.
+pub fn refresh(daily: &mut Daily) {
+    let agents = detect();
+    if daily.checked_at == 0. || agents.codex != daily.agents.codex || agents.claude != daily.agents.claude {
+        eprintln!("[RFP WATCHER] Codex={} Claude Code={} (same-user process check; rfp inspect for countdown)", agents.codex, agents.claude);
+    }
+    daily.agents = agents;
+    daily.checked_at = SystemClock.now();
 }
 
 pub fn reminder_action(app: AppHandle, action: String, minutes: Option<u32>) -> Result<(), String> {

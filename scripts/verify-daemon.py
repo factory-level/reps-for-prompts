@@ -41,6 +41,9 @@ with tempfile.TemporaryDirectory(prefix='rfp-watcher-test-') as folder:
     try:
         with (profile/'daemon.log').open('w') as log:
             proc=launch(log)
+            # V2 rests IDLE: nothing counts down until a session starts.
+            wait_for(lambda v:v.get('fresh') is True)
+            command('start')
             initial=wait_for(lambda v:v.get('state')=='counting')
             assert initial['agents']['codex'] or initial['agents']['claude']
             command('snooze','--minutes','5')
