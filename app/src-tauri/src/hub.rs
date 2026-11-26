@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use engine::session::{Fact, Release};
 use hub_client::{EnableMetric, HubSupervisor, HubSupervisorConfig, VisionEvent, VisionHub};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::detector::{CameraSet, CameraSettings};
 use crate::vision_status::Signal;
@@ -306,8 +306,8 @@ pub fn start(app: AppHandle) {
 
 /// Print a terminal line when the camera gains/loses your pose (deduped — no
 /// per-frame angle spam), so you can tell from the terminal whether you're in
-/// frame while a set runs.
-fn print_detect(data: &serde_json::Value) {
+/// frame while a set runs. The same change reaches the windows as `vision-pose`.
+fn print_detect(app: &AppHandle, data: &serde_json::Value) {
     static LAST: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
     let pose = data.get("poseDetected").and_then(|v| v.as_bool()).unwrap_or(false);
     if let Ok(mut last) = LAST.lock() {
@@ -321,6 +321,7 @@ fn print_detect(data: &serde_json::Value) {
                 }
             );
             *last = Some(pose);
+            let _ = app.emit("vision-pose", serde_json::json!({"detected": pose}));
         }
     }
 }
@@ -332,9 +333,9 @@ fn pump_events(app: AppHandle, rx: std::sync::mpsc::Receiver<VisionEvent>) {
     for event in rx {
         if app.state::<crate::Runtime>().is_stopping() { break; }
         match &event {
-            // Landmarks are terminal-only now: nothing in the webviews listens,
-            // and pushing them at camera rate into both windows leaked memory.
-            VisionEvent::Landmarks(data) => print_detect(data),
+            // Landmarks stay out of the webviews: pushing them at camera rate
+            // into both windows leaked memory. Only the deduped pose change goes.
+            VisionEvent::Landmarks(data) => print_detect(&app, data),
             VisionEvent::Semantic { kind, payload } => {
                 if kind == "detector_error" || kind == "stream_ended" {
                     crate::control::error(&app, format!("{kind}: {payload}"));

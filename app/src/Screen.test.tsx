@@ -1,10 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { listen } from "@tauri-apps/api/event";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { Screen } from "./Screen";
 import { app, base } from "./fixtures";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(() => Promise.resolve(true)) }));
+vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(() => Promise.resolve(() => {})) }));
 
 const press = { exercise: "overhead", kind: "REP", targetReps: 12, targetSeconds: 0, defaultWeight: 0 } as const;
 
@@ -55,5 +57,22 @@ describe("gym monitor", () => {
     render(<Screen snapshot={base} app={app} />);
     fireEvent.click(screen.getByRole("button", { name: "Fullscreen" }));
     expect(invoke).toHaveBeenCalledWith("toggle_fullscreen");
+  });
+  it("shows whether the detector sees a pose during a set, unless vision is down", async () => {
+    const handlers: Record<string, (e: { payload: unknown }) => void> = {};
+    vi.mocked(listen).mockImplementation(((name: string, fn: (e: { payload: unknown }) => void) => { handlers[name] = fn; return Promise.resolve(() => {}); }) as never);
+    const live = { ...base, phase: "WORKOUT_ACTIVE" as const, prescription: press };
+    const { rerender } = render(<Screen snapshot={live} app={app} />);
+    await waitFor(() => expect(handlers["vision-pose"]).toBeDefined());
+    act(() => handlers["vision-pose"]({ payload: { detected: false } }));
+    expect(screen.getByText(/Not in frame · step back/)).toBeInTheDocument();
+    act(() => handlers["vision-pose"]({ payload: { detected: true } }));
+    expect(screen.getByText("● In frame · tracking")).toBeInTheDocument();
+    rerender(<Screen snapshot={live} app={app} vision={{ state: "unavailable", reason: "debug" }} />);
+    expect(screen.queryByText(/In frame/)).not.toBeInTheDocument();
+    // The set ends: the next one starts without a stale answer.
+    rerender(<Screen snapshot={{ ...live, phase: "WEIGHT_CONFIRMATION" }} app={app} />);
+    rerender(<Screen snapshot={live} app={app} />);
+    expect(screen.queryByText(/In frame/)).not.toBeInTheDocument();
   });
 });

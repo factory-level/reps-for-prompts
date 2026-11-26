@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
-import { useLayoutEffect, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { AppState, Snapshot } from "./snapshot";
 import { titleCase } from "./snapshot";
 
@@ -44,7 +45,7 @@ export function FitTitle({ text }: { text: string }) {
 }
 
 /** The gym monitor's word and status for the current state (spec §4.4, M01–M08). */
-function view(snapshot: Snapshot, app: AppState | null, vision: Vision | undefined, debug: boolean) {
+function view(snapshot: Snapshot, app: AppState | null, vision: Vision | undefined, debug: boolean, pose: boolean | null) {
   const rx = snapshot.prescription;
   const day = snapshot.day;
   const item = day?.items.find((i) => i.name === rx?.exercise);
@@ -102,6 +103,7 @@ function view(snapshot: Snapshot, app: AppState | null, vision: Vision | undefin
           <span key="h" className="medium">{label}</span>,
           <span key="a" className="big">{reps ? `${String(value).padStart(2, "0")} / ${target}` : `${mmss(value)} / ${mmss(target)}`}</span>,
           <span key="b" className="small">{manual ? "MANUAL MODE · finish on your computer" : `${setOf} · ${reps ? "reps" : "seconds"}`}</span>,
+          !manual && pose !== null && <span key="p" className="small">{pose ? "● In frame · tracking" : "○ Not in frame · step back so your whole body is visible"}</span>,
         ],
       };
     }
@@ -109,6 +111,15 @@ function view(snapshot: Snapshot, app: AppState | null, vision: Vision | undefin
 }
 
 export function Screen({ snapshot, app = null, debug = false, vision }: { snapshot: Snapshot; app?: AppState | null; debug?: boolean; vision?: Vision }) {
+  // Whether the detector sees a body: unknown until it says, forgotten once the set ends.
+  const [pose, setPose] = useState<boolean | null>(null);
+  const active = snapshot.phase === "WORKOUT_ACTIVE";
+  useEffect(() => { if (!active) setPose(null); }, [active]);
+  useEffect(() => {
+    let live = true; let unlisten: (() => void) | undefined;
+    void listen<{ detected: boolean }>("vision-pose", ({ payload }) => { if (live) setPose(payload.detected); }).then((fn) => { if (live) unlisten = fn; else fn(); });
+    return () => { live = false; unlisten?.(); };
+  }, []);
   // Set logged → whole-screen beat before the next interval.
   if (snapshot.phase === "UNLOCKED") {
     return (
@@ -122,7 +133,7 @@ export function Screen({ snapshot, app = null, debug = false, vision }: { snapsh
       </div>
     );
   }
-  const v = view(snapshot, app, vision, debug);
+  const v = view(snapshot, app, vision, debug, pose);
   return (
     <div className={`stage ${v.mode}`} data-phase={snapshot.phase} data-tauri-drag-region="deep">
       <FullscreenButton />

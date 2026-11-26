@@ -1,6 +1,6 @@
 //! Control the existing app/session from a private Unix socket.
 use tauri::{AppHandle,Manager,Emitter};
-use engine::types::Phase;
+use engine::types::{ExerciseKind,Phase};
 use reps_cli::control::Command;
 use crate::{Lifecycle,Runtime,daily};
 
@@ -22,6 +22,12 @@ fn view(app:&AppHandle,name:&str,preview:bool){
 }
 fn stop_preview(app:&AppHandle){app.state::<Lifecycle>().preview_off();view(app,"screen",false);}
 fn show(app:&AppHandle){if let Some(w)=app.get_webview_window("main"){let _=w.show();let _=w.unminimize();}}
+/// `--all`: nothing left running. Previews, fixture video and the camera stop
+/// and every window hides (RFP no longer locks, so none must stay up).
+fn close_all(app:&AppHandle){
+ stop_preview(app);crate::stop_debug_process(app);app.state::<Lifecycle>().release_camera();
+ for w in app.webview_windows().values(){let _=w.hide();}
+}
 fn dispatch(app:&AppHandle, command:Command)->Result<serde_json::Value,String>{
  command.validate()?;
 
@@ -67,17 +73,30 @@ fn dispatch(app:&AppHandle, command:Command)->Result<serde_json::Value,String>{
     },_=>unreachable!()
    }
   },
-  Command::Debug{operation,exercise,value,video}=>{
+  Command::Debug{operation,exercise,value,video,state,reps,seconds,weight,all}=>{
    app.state::<Runtime>().require_debug()?;
    match operation.as_str(){
     "history"=>{let life=app.state::<Lifecycle>();let core=life.core();return Ok(serde_json::json!({"source":"debug","records":core.store.records(None,None,0,100,false).map_err(|e|e.to_string())?}));},
     "exercises"=>return serde_json::to_value(crate::detector::debug_exercise_options()?).map_err(|e|e.to_string()),
     "videos"=>return serde_json::to_value(crate::debug_videos(app.clone())?).map_err(|e|e.to_string()),
     "start"=>{
-     let selected=exercise.map(|name|crate::detector::debug_exercise_options()?.into_iter().find(|rx|rx.exercise==name).ok_or_else(||format!("Unknown exercise: {name}"))).transpose()?;
-     view(app,"screen",false);crate::stop_debug_process(app);app.state::<Lifecycle>().debug_start(selected)?;show(app);
+     if (reps.is_some()||seconds.is_some()||weight.is_some())&&exercise.is_none(){return Err("Programming a set needs --exercise NAME".into());}
+     let selected=exercise.map(|name|crate::detector::debug_exercise_options()?.into_iter().find(|rx|rx.exercise==name).ok_or_else(||format!("Unknown exercise: {name}"))).transpose()?
+      .map(|mut rx|{
+       if let Some(n)=reps{rx.kind=ExerciseKind::Rep;rx.target_reps=n;rx.target_seconds=0.;}
+       if let Some(n)=seconds{rx.kind=ExerciseKind::Continuous;rx.target_seconds=n;rx.target_reps=0;}
+       if let Some(n)=weight{rx.default_weight=n;}
+       rx
+      });
+     view(app,"screen",false);crate::stop_debug_process(app);
+     let life=app.state::<Lifecycle>();life.debug_start(selected)?;
+     let state=state.as_deref().unwrap_or("live");life.debug_detection(state)?;
+     // The camera is off, so no landmarks will say it: tell the windows directly.
+     if state=="no-pose"{println!("[DETECT] 🔴 no pose in frame (simulated)");let _=app.emit("vision-pose",serde_json::json!({"detected":false}));}
+     show(app);
     },
-    "stop"=>{view(app,"screen",false);crate::stop_debug_process(app);app.state::<Lifecycle>().debug_stop()?;},
+    "stop"=>{view(app,"screen",false);crate::stop_debug_process(app);app.state::<Lifecycle>().debug_stop()?;if all{close_all(app);}},
+    "next"=>{stop_preview(app);let snap=app.state::<Lifecycle>().debug_next(weight)?;if !matches!(snap.phase,Phase::Coding|Phase::Idle){show(app);}},
     "step"|"done"=>{app.state::<Lifecycle>().debug_progress(value,operation=="done")?;},
     "video"=>{stop_preview(app);view(app,"video",false);show(app);crate::debug_stream_start(app.clone(),video.ok_or("Supply --file PATH")?,exercise.ok_or("Supply --exercise NAME")?)?;},
     "video-stop"=>{crate::stop_debug_process(app);view(app,"screen",false);},_=>unreachable!()
@@ -96,7 +115,7 @@ fn dispatch(app:&AppHandle, command:Command)->Result<serde_json::Value,String>{
   Command::Snooze{minutes}=>daily::reminder_action(app.clone(),"snooze".into(),Some(minutes))?,
   Command::Skip=>daily::reminder_action(app.clone(),"skip".into(),None)?,
   // Ends the session early: confirmed sets stay, the cycle does not move.
-  Command::Cancel=>{view(app,"screen",false);crate::stop_debug_process(app);if app.state::<Runtime>().is_debug(){app.state::<Lifecycle>().cancel();}else{app.state::<Lifecycle>().end_workout();}},
+  Command::Cancel{all}=>{view(app,"screen",false);crate::stop_debug_process(app);if app.state::<Runtime>().is_debug(){app.state::<Lifecycle>().cancel();}else{app.state::<Lifecycle>().end_workout();}if all{close_all(app);}},
   Command::Finish{weight,honor}=>{app.state::<Lifecycle>().finish(weight,honor)?;},
   Command::Settings{minutes,lock_mode}=>{
    if lock_mode==Some(true){return Err("RFP never locks the desktop; lock mode was removed".into());}
