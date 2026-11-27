@@ -16,6 +16,8 @@ pub struct FakeHub {
     /// Fails the next `enable_metric` only — `fail_next` would be consumed by
     /// the stale-stream disable that precedes every enable.
     pub fail_next_enable: bool,
+    /// The next N `enable_metric` calls fail as if another process held the camera.
+    pub camera_busy_enables: u32,
     enabled: Vec<String>,
 }
 
@@ -31,6 +33,7 @@ impl FakeHub {
             rx: Some(rx),
             fail_next: false,
             fail_next_enable: false,
+            camera_busy_enables: 0,
             enabled: vec![],
         }
     }
@@ -57,6 +60,11 @@ impl VisionHub for FakeHub {
     fn enable_metric(&mut self, req: &EnableMetric) -> Result<(), HubError> {
         if std::mem::take(&mut self.fail_next_enable) {
             return Err(HubError::Down);
+        }
+        if self.camera_busy_enables > 0 {
+            self.camera_busy_enables -= 1;
+            self.log(format!("busy:{}", req.metric_id));
+            return Err(HubError::Api("cannot open camera: {'id': 'webcam'}".into()));
         }
         self.check_fail()?;
         self.log(format!("enable:{}:{}", req.metric_id, req.plugin_id));

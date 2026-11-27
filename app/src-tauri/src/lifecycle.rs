@@ -118,6 +118,12 @@ fn new_session_id() -> String {
     format!("sess-{}", uuid::Uuid::new_v4())
 }
 
+/// How often an enable retries a camera another process still holds, and how
+/// long it waits between tries (the vision host of a hub that just died
+/// releases the camera within ~2 s).
+const CAMERA_BUSY_RETRIES: u32 = 5;
+const CAMERA_BUSY_WAIT: std::time::Duration = std::time::Duration::from_millis(if cfg!(test) { 1 } else { 1000 });
+
 impl Lifecycle {
     pub fn new(
         core: Core,
@@ -707,18 +713,31 @@ impl Lifecycle {
             Err(HonorReason::PhoneUrlInvalid) => Err(("Cannot read phone stream credentials file".to_string(), false)),
             Err(HonorReason::Settings(error)) => Err((error, false)),
             Ok((mut request, camera_set)) => {
-                let mut hub = self.hub.lock().unwrap();
-                if self.gate.lock().unwrap().generation != generation { return; }
                 request.config["sessionId"] = json!(session);
-                match hub.as_mut() {
-                    Some(hub) => {
-                        self.gate.lock().unwrap().active = true;
-                        enable_on_hub(hub.as_mut(), &camera_set, &request).map_err(|error| {
+                let mut attempt = 0;
+                loop {
+                    let mut hub = self.hub.lock().unwrap();
+                    if self.gate.lock().unwrap().generation != generation { return; }
+                    let result = match hub.as_mut() {
+                        Some(hub) => {
+                            self.gate.lock().unwrap().active = true;
+                            enable_on_hub(hub.as_mut(), &camera_set, &request).map_err(|error| error.to_string())
+                        }
+                        None => Err("hub not running".to_string()),
+                    };
+                    // Right after a hub restart the old vision host can still hold
+                    // the camera for a moment: wait for it rather than give up.
+                    match result {
+                        Err(error) if error.contains("cannot open camera") && attempt < CAMERA_BUSY_RETRIES => {
+                            drop(hub);
+                            attempt += 1;
+                            std::thread::sleep(CAMERA_BUSY_WAIT);
+                        }
+                        other => break other.map_err(|error| {
                             eprintln!("hub: enable_metric failed: {error}");
-                            (error.to_string(), true)
-                        })
+                            (error, true)
+                        }),
                     }
-                    None => Err(("hub not running".to_string(), true)),
                 }
             }
         };
@@ -1709,5 +1728,19 @@ mod tests {
         let squat = detector::debug_exercise_options().unwrap().into_iter().find(|rx| rx.exercise == "squat");
         rig.life.debug_start(squat).unwrap();
         assert_eq!(tick(&rig, ABANDON_AFTER * 2.0, reminding()).0.phase, Phase::WorkoutActive);
+    }
+
+    #[test]
+    fn a_camera_still_held_by_another_process_is_waited_for() {
+        // Right after a hub restart, the dead hub's vision host lets go of the
+        // camera a moment late; the enable waits instead of giving up.
+        let mut hub = FakeHub::new(vec![]);
+        hub.camera_busy_enables = 2;
+        let rig = rig(LIFTS, Some(hub), false);
+        start(&rig);
+        assert_eq!(rig.calls().iter().filter(|call| call.starts_with("busy:")).count(), 2);
+        assert_eq!(enables(&rig), 1);
+        assert!(rig.active());
+        assert_eq!(rig.life.vision_status(), VisionStatus::Available);
     }
 }
