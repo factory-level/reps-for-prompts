@@ -45,6 +45,11 @@ struct Gate {
     active: bool,
     /// The detector runs only to show the camera: its frames count for nothing.
     preview: bool,
+    /// The hub dropped while this set's detector ran: re-enable once it is back.
+    resume: bool,
+    /// Progress earlier detector runs of this set counted. A re-enabled run
+    /// counts from 0, so its frames are reported on top of this.
+    offset: f64,
     /// When the tick loop first saw the set complete (the "LOGGED" beat).
     unlocked_since: Option<f64>,
     /// The active set's last progress value and when it last changed.
@@ -184,7 +189,7 @@ impl Lifecycle {
         let left_active = was_active && snapshot.phase != Phase::WorkoutActive;
         if facts.contains(&Fact::Started) {
             if let Some(rx) = &snapshot.prescription {
-                self.enable(rx.exercise.clone(), rx.target_reps, rx.target_seconds, false);
+                self.enable(rx.exercise.clone(), rx.target_reps, rx.target_seconds, false, 0.);
             }
         } else if left_active
             || facts.iter().any(|fact| matches!(fact, Fact::Completed | Fact::Released(_) | Fact::CodingStarted))
@@ -425,13 +430,14 @@ impl Lifecycle {
                 // Checked under the session lock, so a late frame cannot slip
                 // into the set that follows a cancel or a preview.
                 let _ = self.step(|core, _, _| {
-                    let counts = {
+                    let offset = {
                         let gate = self.gate.lock().unwrap();
-                        gate.active && !gate.preview && context.belongs_to(WORKOUT_METRIC, gate.session_id.as_deref())
+                        let counts = gate.active && !gate.preview && context.belongs_to(WORKOUT_METRIC, gate.session_id.as_deref());
+                        counts.then_some(gate.offset)
                     };
-                    if !counts { return Err("ignored".into()); }
+                    let Some(offset) = offset else { return Err("ignored".into()) };
                     self.signal(if disconnected { Signal::CameraDisconnected } else { Signal::LiveFrame });
-                    Ok(core.session.report_progress(Progress { value, unit, satisfied }))
+                    Ok(core.session.report_progress(Progress { value: offset + value, unit, satisfied }))
                 });
             }
             VisionEvent::CameraFrame { camera_id, data } => {
@@ -445,9 +451,39 @@ impl Lifecycle {
             VisionEvent::Health(health) => {
                 if health.vision_host == "down" { self.signal(Signal::HubDown); }
             }
-            VisionEvent::ConnectionLost => self.signal(Signal::ConnectionLost),
+            VisionEvent::ConnectionLost => {
+                // The dead hub's run is over: none of its frames count from
+                // here, so the set's progress stands where it was.
+                let mut gate = self.gate.lock().unwrap();
+                gate.resume |= gate.active && !gate.preview;
+                gate.active = false;
+                drop(gate);
+                self.signal(Signal::ConnectionLost);
+            }
+            VisionEvent::Reconnected => {
+                self.signal(Signal::HubUp);
+                self.resume_set();
+            }
             VisionEvent::Landmarks(_) => {}
         }
+    }
+
+    /// The hub was respawned mid-set: run the detector again, same session,
+    /// new generation, for what is left of the set. Its count starts at 0, so
+    /// it is asked for the remainder and its frames land on top of the reps
+    /// (or seconds) already counted.
+    fn resume_set(&self) {
+        let core = self.core();
+        let snapshot = core.session.snapshot(self.clock.now());
+        if !std::mem::take(&mut self.gate.lock().unwrap().resume) || snapshot.phase != Phase::WorkoutActive { return; }
+        let Some(rx) = snapshot.prescription else { return };
+        let done = snapshot.progress.map(|p| p.value).unwrap_or(0.);
+        let (reps, seconds) = if rx.target_seconds > 0. {
+            (rx.target_reps, (rx.target_seconds - done).max(1.))
+        } else {
+            (rx.target_reps.saturating_sub(done as u32).max(1), rx.target_seconds)
+        };
+        self.enable(rx.exercise, reps, seconds, false, done);
     }
 
     /// Complete the set: log the weight once the target was reached, or —
@@ -489,7 +525,7 @@ impl Lifecycle {
             return Err("Finish, skip, or cancel the current break before starting camera preview".into());
         }
         let preview = phase == Phase::Coding;
-        if preview { self.enable("squat".into(), 100000, 0., true); }
+        if preview { self.enable("squat".into(), 100000, 0., true, 0.); }
         Ok(preview)
     }
 
@@ -638,11 +674,13 @@ impl Lifecycle {
     /// failure signals the vision status so the UI offers honor mode.
     /// A preview runs under a session id of its own that is never the
     /// workout's, so none of its frames can count toward a set.
-    fn enable(&self, exercise: String, target_reps: u32, target_seconds: f64, preview: bool) {
+    fn enable(&self, exercise: String, target_reps: u32, target_seconds: f64, preview: bool, offset: f64) {
         let (generation, session) = {
             let mut gate = self.gate.lock().unwrap();
             gate.generation += 1;
             gate.preview = preview;
+            gate.resume = false;
+            gate.offset = offset;
             let session = if preview { new_session_id() } else {
                 if self.debug || gate.session_id.is_none() { gate.session_id = Some(new_session_id()); }
                 gate.session_id.clone().unwrap_or_default()
@@ -709,6 +747,7 @@ impl Lifecycle {
         gate.generation += 1;
         gate.active = false;
         gate.preview = false;
+        gate.resume = false;
         self.signal(Signal::DetectorOff);
         (gate.generation, gate.session_id.clone())
     }
@@ -1256,6 +1295,133 @@ mod tests {
         assert_eq!(rig.life.vision_status(), VisionStatus::Available);
         rig.life.progress(VisionEvent::ConnectionLost);
         assert_eq!(rig.life.vision_status(), VisionStatus::Unavailable { reason: "Vision hub connection lost".into() });
+    }
+
+    fn enables(rig: &Rig) -> usize {
+        rig.calls().iter().filter(|call| call.starts_with("enable:")).count()
+    }
+
+    #[test]
+    fn a_set_resumes_after_the_hub_restarts_and_counts_on_from_its_reps() {
+        let rig = rig(LIFTS, Some(FakeHub::new(vec![])), false);
+        start(&rig);
+        let before = session(&rig);
+        let generation = rig.life.gate.lock().unwrap().generation;
+        reps(&rig, 2.0, false);
+
+        rig.life.progress(VisionEvent::ConnectionLost);
+        assert_eq!(rig.life.vision_status(), VisionStatus::Unavailable { reason: "Vision hub connection lost".into() });
+        // A late frame of the dead hub's run counts for nothing.
+        reps(&rig, 4.0, false);
+        assert_eq!(rig.life.snapshot().progress.unwrap().value, 2.0);
+
+        rig.life.progress(VisionEvent::Reconnected);
+        assert_eq!(enables(&rig), 2);
+        assert_eq!(session(&rig), before);
+        assert!(rig.life.gate.lock().unwrap().generation > generation);
+        assert!(rig.active());
+        assert_eq!(rig.life.vision_status(), VisionStatus::Available);
+        assert_eq!(rig.types().iter().filter(|t| *t == "detector_started").count(), 2);
+        assert!(rig.wire().iter().all(|(_, published)| *published == before));
+        // The old enable's late result changes nothing.
+        let (published, calls) = (rig.wire().len(), rig.calls().len());
+        rig.life.enable_now(generation, before.as_deref().unwrap(), "squat", 5, 0.0);
+        assert_eq!((rig.wire().len(), rig.calls().len()), (published, calls));
+
+        // The new run counts from 0 toward the 3 reps left.
+        reps(&rig, 1.0, false);
+        assert_eq!(rig.life.snapshot().progress.unwrap().value, 3.0);
+        reps(&rig, 3.0, true);
+        let snapshot = rig.life.snapshot();
+        assert_eq!((snapshot.phase, snapshot.progress.unwrap().value), (Phase::WeightConfirmation, 5.0));
+        assert_eq!(rig.life.finish(95.0, false).unwrap().phase, Phase::Unlocked);
+        assert_eq!(rig.verified(), vec![true]);
+    }
+
+    #[test]
+    fn a_timed_set_resumes_with_the_seconds_it_had() {
+        let rig = rig(r#"{"conditioning":[{"exercise":"jumprope","seconds":60}]}"#, Some(FakeHub::new(vec![])), false);
+        start(&rig);
+        rig.life.progress(frame(session(&rig), 20.0, "seconds", false));
+        rig.life.progress(VisionEvent::ConnectionLost);
+        rig.life.progress(VisionEvent::Reconnected);
+        rig.life.progress(frame(session(&rig), 10.0, "seconds", false));
+        assert_eq!(rig.life.snapshot().progress.unwrap().value, 30.0);
+        rig.life.progress(frame(session(&rig), 40.0, "seconds", true));
+        assert_eq!(rig.life.snapshot().phase, Phase::Unlocked);
+        assert_eq!(rig.life.core().store.history(10).unwrap()[0].seconds, 60.0);
+    }
+
+    #[test]
+    fn a_reconnect_outside_a_running_set_enables_nothing() {
+        // Coding, then a preview.
+        let rig = rig(LIFTS, Some(FakeHub::new(vec![])), false);
+        rig.life.progress(VisionEvent::ConnectionLost);
+        rig.life.progress(VisionEvent::Reconnected);
+        assert!(rig.calls().is_empty());
+        assert_eq!(rig.life.vision_status(), VisionStatus::Available);
+        rig.life.preview_on().unwrap();
+        rig.life.progress(VisionEvent::ConnectionLost);
+        rig.life.progress(VisionEvent::Reconnected);
+        assert_eq!(enables(&rig), 1);
+
+        // Idle.
+        let idle = self::rig(LIFTS, Some(FakeHub::new(vec![])), false);
+        idle.life.end_workout();
+        idle.life.progress(VisionEvent::ConnectionLost);
+        idle.life.progress(VisionEvent::Reconnected);
+        assert_eq!(enables(&idle), 0);
+
+        // A set whose detector never started, and one that ended before the hub came back.
+        let failed = self::rig(LIFTS, Some({ let mut hub = FakeHub::new(vec![]); hub.fail_next_enable = true; hub }), false);
+        start(&failed);
+        failed.life.progress(VisionEvent::ConnectionLost);
+        failed.life.progress(VisionEvent::Reconnected);
+        assert_eq!(enables(&failed), 0);
+        let ended = self::rig(LIFTS, Some(FakeHub::new(vec![])), false);
+        start(&ended);
+        ended.life.progress(VisionEvent::ConnectionLost);
+        ended.life.finish(95.0, true).unwrap();
+        ended.life.progress(VisionEvent::Reconnected);
+        assert_eq!(enables(&ended), 1);
+    }
+
+    #[test]
+    fn a_failed_re_enable_leaves_vision_unavailable_and_honor_completes_the_set() {
+        let rig = rig(LIFTS, Some(FakeHub::new(vec![])), false);
+        start(&rig);
+        reps(&rig, 2.0, false);
+        rig.life.progress(VisionEvent::ConnectionLost);
+        // The respawned hub refuses the enable.
+        let mut refusing = FakeHub::new(vec![]);
+        refusing.fail_next_enable = true;
+        *rig.life.hub.lock().unwrap() = Some(Box::new(refusing));
+        rig.life.progress(VisionEvent::Reconnected);
+        assert_eq!(rig.life.vision_status(), VisionStatus::Unavailable { reason: "hub is down".into() });
+        assert_eq!(payload(&rig, "system_error"), json!({"stage": "enable_metric", "error": "hub is down"}));
+        assert!(!rig.active());
+        reps(&rig, 5.0, true);
+        assert_eq!(rig.life.snapshot().phase, Phase::WorkoutActive);
+        assert_eq!(rig.life.finish(95.0, true).unwrap().phase, Phase::Unlocked);
+        assert_eq!(rig.verified(), vec![false]);
+    }
+
+    #[test]
+    fn a_second_hub_death_leaves_the_set_to_honor() {
+        let rig = rig(LIFTS, Some(FakeHub::new(vec![])), false);
+        start(&rig);
+        rig.life.progress(VisionEvent::ConnectionLost);
+        rig.life.progress(VisionEvent::Reconnected);
+        reps(&rig, 1.0, false);
+        // The supervisor gives up after one restart.
+        rig.life.progress(VisionEvent::ConnectionLost);
+        rig.life.progress(VisionEvent::Health(hub_client::HubHealth::failed()));
+        assert_eq!(rig.life.vision_status(), VisionStatus::Unavailable { reason: "Vision hub is down".into() });
+        reps(&rig, 5.0, true);
+        assert_eq!(rig.life.snapshot().progress.unwrap().value, 1.0);
+        assert_eq!(enables(&rig), 2);
+        assert_eq!(rig.life.finish(95.0, true).unwrap().phase, Phase::Unlocked);
+        assert_eq!(rig.verified(), vec![false]);
     }
 
     #[test]

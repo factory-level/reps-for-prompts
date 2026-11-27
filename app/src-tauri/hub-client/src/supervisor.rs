@@ -341,9 +341,12 @@ impl HubSupervisor {
                     events_rx: None,
                     restarts: Arc::clone(&restarts),
                 };
-                if respawner.spawn_and_connect().is_err() {
-                    dead.store(true, Ordering::SeqCst);
-                    let _ = event_tx.send(VisionEvent::Health(HubHealth::failed()));
+                match respawner.spawn_and_connect() {
+                    Ok(()) => { let _ = event_tx.send(VisionEvent::Reconnected); }
+                    Err(_) => {
+                        dead.store(true, Ordering::SeqCst);
+                        let _ = event_tx.send(VisionEvent::Health(HubHealth::failed()));
+                    }
                 }
                 // respawner shares Arcs; prevent its Drop from killing the child
                 std::mem::forget(respawner);
@@ -507,6 +510,49 @@ mod port_tests {
         assert!(result.is_none(), "must give up only when asked to stop");
         assert_eq!(*attempts.lock().unwrap(), 3, "a failed start must be retried");
         assert!(port_in_use(port), "retrying must not kill the port's owner");
+    }
+
+    /// A stand-in hubd: a WebSocket server in this process that says hello to
+    /// and answers every connection, and a script that prints READY for it. The first run
+    /// exits at once (the hub dies); the respawned one stays up.
+    #[cfg(unix)]
+    #[test]
+    fn a_successful_respawn_reports_reconnected() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let mut ws = tungstenite::accept(stream).unwrap();
+                    let hello = serde_json::json!({"type": "hello", "apiVersion": "1.0", "hubVersion": "mock"});
+                    let _ = ws.send(tungstenite::Message::Text(hello.to_string().into()));
+                    // Answer every request (the client subscribes on connect).
+                    while let Ok(message) = ws.read() {
+                        let Ok(request) = serde_json::from_str::<serde_json::Value>(message.to_text().unwrap_or("")) else { continue };
+                        let reply = serde_json::json!({"id": request["id"], "result": {}});
+                        let _ = ws.send(tungstenite::Message::Text(reply.to_string().into()));
+                    }
+                });
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let script = format!(
+            "echo 'HUBD READY {{\"debugPort\":{port}}}'; if [ -e ran ]; then exec sleep 30; fi; touch ran; sleep 0.3"
+        );
+        let mut supervisor = HubSupervisor::start(HubSupervisorConfig {
+            hub_dir: dir.path().into(),
+            command: vec!["sh".into(), "-c".into(), script],
+            env: vec![("PORT".into(), "0".into())],
+        }).unwrap();
+        let events = supervisor.take_receiver().unwrap();
+        let mut seen = vec![];
+        while let Ok(event) = events.recv_timeout(Duration::from_secs(10)) {
+            let done = event == VisionEvent::Reconnected;
+            seen.push(event);
+            if done { break; }
+        }
+        assert_eq!(seen, [VisionEvent::ConnectionLost, VisionEvent::Reconnected]);
+        assert!(!supervisor.dead.load(Ordering::SeqCst), "one restart must leave the hub up");
     }
 
     #[cfg(unix)]
