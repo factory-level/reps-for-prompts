@@ -37,6 +37,9 @@ pub enum VisionEvent {
     },
     Health(HubHealth),
     ConnectionLost,
+    /// The supervisor respawned hubd after a `ConnectionLost` and is connected
+    /// to it again. The new hub runs no metrics: the app must re-enable.
+    Reconnected,
 }
 
 /// Preserve routing identity through the client instead of losing it at decode.

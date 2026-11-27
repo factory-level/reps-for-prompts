@@ -14,7 +14,7 @@ pub enum VisionStatus {
 pub enum Signal {
     /// The hub process could not start (it keeps retrying).
     HubStartFailed(String),
-    /// The hub answered: started, or accepted an enable after a restart.
+    /// The hub answered: started, respawned, or accepted an enable.
     HubUp,
     /// The supervised hub died and will not be restarted.
     HubDown,
@@ -30,9 +30,9 @@ pub enum Signal {
     DetectorOff,
 }
 
-/// Two levels: the hub process, and this workout's detector. Nothing
-/// re-enables a detector when the hub comes back, so a detector-level error
-/// outlives `HubUp` until a live frame or the end of the workout.
+/// Two levels: the hub process, and this workout's detector. A detector-level
+/// error outlives `HubUp` until a live frame or the end of the workout; only a
+/// set whose running detector lost the hub is re-enabled when it comes back.
 #[derive(Default)]
 pub struct Vision {
     hub_up: bool,
@@ -100,7 +100,7 @@ mod tests {
 
     #[test]
     fn an_enable_that_failed_while_the_hub_was_down_outlives_hub_up() {
-        // Nothing re-enables the detector, so this workout has no camera.
+        // This set's detector never ran, so nothing re-enables it.
         let vision = after([Signal::HubStartFailed("x".into()), Signal::EnableFailed("hub not running".into()), Signal::HubUp]);
         assert_eq!(vision.status(), VisionStatus::Unavailable { reason: "hub not running".into() });
     }

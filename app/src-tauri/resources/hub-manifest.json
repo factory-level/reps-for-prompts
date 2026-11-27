@@ -1,10 +1,10 @@
 {
-  "hubCommit": "0b8afdd7c30e9e4fc4d71d21fa79e018cc2327a3",
+  "hubCommit": "f3bf3b7bac97cb1cd86f56695f0304ec38802a2c",
   "hubDirty": false,
   "apiVersion": "1.6",
   "nodeEngine": ">=22.5",
   "artifactSha256s": {
-    "hubd.mjs": "3b58d0baf9363d72ea459a62e7e0f89fff0dcf7ef4c47d5598fb97b5792f50a3",
+    "hubd.mjs": "02dde02686428eecc7e249f963e50bffeeb7fb6d3f192c19b07b779a045c1249",
     "public/app.js": "8e4eb0da8f21fd8c400a85a1b21bcec40fead282739fac1ab1435ec28f4fcf7a",
     "public/debug-cameras.css": "881f43c8d875b619c1b1a39889563c9cb0ac7a4132e35ed59c8153d5df2e1d9e",
     "public/debug-cameras.html": "e03480c97fdb7ae98b6463921f863a276e5975c929e111b69a7dce13014ab193",
@@ -17,7 +17,7 @@
     "vision/host/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "vision/host/models.py": "672539f9150f4e13f09f04063a31a85de9e8ad0b90bec4c674e9a2bf66ee2d33",
     "vision/host/registry.py": "fef8640920985400a19e73a2762b19775553eb546c81991219c1046f6bb47d43",
-    "vision/host/server.py": "5ce2b225155d6ce6771ef93b4b18a8bf241ff6feb62edfff8ba8a12516c4c1e1",
+    "vision/host/server.py": "222733a80df7d2fc90ceadee6a5e3bb4976b3c4b635df89bfcd0e8dedf6e79bd",
     "vision/plugins/frame_stats/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "vision/plugins/frame_stats/plugin.py": "1b43646864560756d3a50b500dbf23e2ddb5acb612d34bb30f208fdb72928d9e",
     "vision/plugins/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
