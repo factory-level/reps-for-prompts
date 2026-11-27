@@ -13,6 +13,7 @@ pub fn report(runtime: Result<Value,String>, now:f64)->Value {
  else if s["mode"]!="workout" {("debug","Debug mode: automatic reminders disabled. Run rfp mode workout.".into())}
  else if phase=="EXERCISE_REQUIRED" {("reminder","Workout due. WORKOUT display requested; rfp show reveals it, rfp start begins the set.".into())}
  else if phase!="CODING" {("in-progress",format!("Workout phase: {phase}. Run rfp status --json for details."))}
+ else if s["snapshot"]["paused"]==true {("paused","Session paused: the countdown is frozen. Resume from the RFP window or tray.".into())}
  else if s["snapshot"]["day"]["complete"]==true {("complete","Today's routine is complete; no further reminders today.".into())}
  else if s["display"]["previewOnly"]==true {("preview","Countdown paused for camera preview. Run rfp camera stop.".into())}
  else if s["settings"]["snoozeUntil"].as_f64().unwrap_or(0.)>now {("snoozed",format!("Reminder snoozed for {} more seconds.",(s["settings"]["snoozeUntil"].as_f64().unwrap()-now).ceil() as u64))}
@@ -42,5 +43,5 @@ pub fn run(args:&[String])->Result<(),String>{
  fn sample()->Value{json!({"pid":123,"mode":"workout","settings":{"checkedAt":100.,"agents":{"codex":true,"claude":false}},"snapshot":{"phase":"CODING","remainingSeconds":61.},"display":{}})}
  #[test] fn fresh_daemon_arms(){let v=report(Ok(sample()),102.);assert_eq!(v["state"],"counting");assert_eq!(v["armed"],true);}
  #[test] fn offline_or_stale_never_arms(){assert_eq!(report(Ok(sample()),111.)["state"],"stale");assert_eq!(report(Err("offline".into()),102.)["armed"],false);}
- #[test] fn explains_pauses(){for(path,value,expected)in [(vec!["mode"],json!("debug"),"debug"),(vec!["settings","agents","codex"],json!(false),"waiting"),(vec!["settings","snoozeUntil"],json!(200.),"snoozed"),(vec!["display","previewOnly"],json!(true),"preview"),(vec!["snapshot","day","complete"],json!(true),"complete"),(vec!["snapshot","phase"],json!("EXERCISE_REQUIRED"),"reminder")]{let mut s=sample();let mut field=&mut s;for key in path{field=&mut field[key];}*field=value;let v=report(Ok(s),102.);assert_eq!(v["state"],expected);assert_eq!(v["armed"],false);}}
+ #[test] fn explains_pauses(){for(path,value,expected)in [(vec!["mode"],json!("debug"),"debug"),(vec!["settings","agents","codex"],json!(false),"waiting"),(vec!["settings","snoozeUntil"],json!(200.),"snoozed"),(vec!["display","previewOnly"],json!(true),"preview"),(vec!["snapshot","day","complete"],json!(true),"complete"),(vec!["snapshot","phase"],json!("EXERCISE_REQUIRED"),"reminder"),(vec!["snapshot","paused"],json!(true),"paused")]{let mut s=sample();let mut field=&mut s;for key in path{field=&mut field[key];}*field=value;let v=report(Ok(s),102.);assert_eq!(v["state"],expected);assert_eq!(v["armed"],false);}}
 }

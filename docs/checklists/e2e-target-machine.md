@@ -46,9 +46,7 @@ workout screen appears mid-run.
       (the installed hub's debug listener is local and unauthenticated)
 - [ ] `python3 scripts/verify-passive.py` → snooze survives restart, zero credit
 - [ ] `python3 scripts/verify-daemon.py` → run **last**; it stops and restarts
-      `rfp.service`. **Fails on V2 builds:** V2 removed the agent watcher and the
-      end-of-day warning this script exercises (`rfp inspect` always reports
-      `stale`). Passes on pre-V2 builds.
+      `rfp.service`
 - [ ] Read-only surfaces: `rfp inspect`, `rfp site`, `rfp profile`,
       `rfp status --source remote`, `rfp summary`
 

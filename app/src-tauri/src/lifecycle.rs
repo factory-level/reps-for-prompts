@@ -63,8 +63,18 @@ pub struct Tick {
     pub defer: f64,
     /// The coding period ends now: a snooze ran out, or the workday warning fired.
     pub expire: bool,
-    /// Reminders may fire: nothing is snoozed.
+    /// Reminders may fire: an agent is open, no preview runs, nothing is snoozed.
     pub remind: bool,
+}
+
+impl Tick {
+    /// Only agent time counts: coding time runs, and reminders fire, while a
+    /// coding agent is open and no camera preview runs. A snooze holds both;
+    /// a gap over 5 s (sleep) never counts.
+    pub fn new(elapsed: f64, agent: bool, previewing: bool, snoozed: bool, expire: bool) -> Tick {
+        let working = agent && !previewing;
+        Tick { defer: engine::activity::excluded_elapsed(elapsed, working, snoozed), expire, remind: working && !snoozed }
+    }
 }
 
 #[derive(Clone)]
@@ -319,6 +329,26 @@ impl Lifecycle {
         drop(core);
         self.effects.snapshot(&snapshot);
         (snapshot, locked)
+    }
+
+    /// The end-of-workday warning, at most once per local date: due from
+    /// `workday_end - workday_warn_minutes` while a session is coding or due a
+    /// set, reminders may fire (`remind`, see `Tick::new`), and sets of the
+    /// session's routine remain. Records the date and, while coding, expires
+    /// the interval so the set is asked for now. Returns the message.
+    pub fn workday_warning(&self, now: f64, minute: u32, today: &str, remind: bool) -> Option<String> {
+        use reps_cli::workday::{due, parse_time};
+        if self.debug { return None; }
+        let mut core = self.core();
+        let snap = core.session.snapshot(now);
+        let eligible = remind && !snap.paused && matches!(snap.phase, Phase::Coding | Phase::ExerciseRequired);
+        let remaining = snap.day.as_ref().map(|d| d.sets_total.saturating_sub(d.sets_done)).unwrap_or(0);
+        let end = parse_time(&core.store.setting("workday_end", "18:00")).unwrap_or(1080);
+        let lead = core.store.setting("workday_warn_minutes", "60").parse().unwrap_or(60);
+        let sent = core.store.setting("last_day_warning", "") == today;
+        if !due(minute, end, lead, eligible, remaining, sent) || core.store.set_setting("last_day_warning", today).is_err() { return None; }
+        if snap.phase == Phase::Coding { core.session.configure_timer(0., now); }
+        Some(format!("Your workday is ending soon or has ended. {remaining} workout sets remain — you might miss today's routine. Start when ready: rfp start"))
     }
 
     /// True once an active set has shown no new progress for ABANDON_AFTER.
@@ -1254,6 +1284,52 @@ mod tests {
         assert!(!tick(&rig, 1500.0, Tick { defer: 1500.0, ..reminding() }).1);
         assert_eq!(rig.life.snapshot().remaining_seconds, 1500.0);
         assert!(tick(&rig, 1.0, Tick { expire: true, ..reminding() }).1);
+    }
+
+    #[test]
+    fn only_agent_time_counts_and_reminds() {
+        // (agent, previewing, snoozed) -> (deferred of 1 s, remind)
+        for (agent, preview, snoozed, defer, remind) in [
+            (true, false, false, 0.0, true),
+            (false, false, false, 1.0, false),
+            (true, true, false, 1.0, false),
+            (true, false, true, 1.0, false),
+        ] {
+            let tick = Tick::new(1.0, agent, preview, snoozed, false);
+            assert_eq!((tick.defer, tick.remind), (defer, remind), "agent={agent} preview={preview} snoozed={snoozed}");
+        }
+        // Sleep never counts, even with an agent open.
+        assert_eq!(Tick::new(60.0, true, false, false, false).defer, 60.0);
+        assert!(Tick::new(1.0, true, false, false, true).expire);
+    }
+
+    #[test]
+    fn the_workday_warning_fires_once_in_a_session_and_asks_for_the_set_now() {
+        let warned = rig(LIFTS, None, false);
+        let store = |key: &str, value: &str| warned.life.core().store.set_setting(key, value).unwrap();
+        store("workday_end", "18:00");
+        store("workday_warn_minutes", "60");
+        assert_eq!(warned.life.workday_warning(warned.clock.now(), 1019, DAY, true), None);
+        // No agent at work, snoozed or previewing: nothing reminds.
+        assert_eq!(warned.life.workday_warning(warned.clock.now(), 1020, DAY, false), None);
+        let message = warned.life.workday_warning(warned.clock.now(), 1020, DAY, true).unwrap();
+        assert!(message.contains("3 workout sets remain") && message.contains("might miss"), "{message}");
+        assert_eq!(warned.life.core().store.setting("last_day_warning", ""), DAY);
+        assert_eq!(warned.life.snapshot().remaining_seconds, 0.0);
+        assert!(tick(&warned, 0.0, reminding()).1, "locks in the same tick");
+        assert_eq!(warned.life.workday_warning(warned.clock.now(), 1100, DAY, true), None);
+        // A new date warns again, also when the set is already due.
+        assert!(warned.life.workday_warning(warned.clock.now(), 1100, "2026-11-24", true).is_some());
+
+        // Paused, idle or debug: no warning.
+        let paused = rig(LIFTS, None, false);
+        paused.life.pause().unwrap();
+        assert_eq!(paused.life.workday_warning(1000.0, 1439, DAY, true), None);
+        let idle = rig(LIFTS, None, false);
+        idle.life.end_workout();
+        assert_eq!(idle.life.snapshot().phase, Phase::Idle);
+        assert_eq!(idle.life.workday_warning(1000.0, 1439, DAY, true), None);
+        assert_eq!(rig(LIFTS, None, true).life.workday_warning(1000.0, 1439, DAY, true), None);
     }
 
     /// V2: an idle app, a two-routine cycle, one full session.

@@ -562,6 +562,7 @@ pub fn run() {
             handle.state::<Lifecycle>().begin();
             std::thread::spawn(move || {
                 let mut previous = SystemClock.now();
+                let mut last_poll = 0.;
                 loop {
                     std::thread::sleep(Duration::from_secs(1));
                     let clock = SystemClock;
@@ -569,27 +570,34 @@ pub fn run() {
                     let life = handle.state::<Lifecycle>();
                     let runtime = handle.state::<Runtime>();
                     if runtime.is_stopping() { break; }
+                    let poll_due = now - last_poll >= 5.;
+                    if poll_due { last_poll = now; }
                     let elapsed = (now - previous).max(0.); previous = now;
-                    let (defer, snooze_expired, snoozed) = {
+                    let (tick, snoozed, agents) = {
                         let daily_state = handle.state::<daily::SharedDaily>();
                         let mut daily = daily_state.lock().unwrap();
+                        if poll_due { daily::refresh(&mut daily); }
                         let snoozed = daily.snooze_until > now;
-                        // Sleep/suspend is not coding time: a jump over 5s is deferred.
-                        let defer = engine::activity::excluded_elapsed(elapsed, true, snoozed);
                         let snooze_expired = daily.snooze_until > 0. && daily.snooze_until <= now;
                         if snooze_expired { daily.snooze_until = 0.; }
-                        (defer, snooze_expired, snoozed)
+                        (lifecycle::Tick::new(elapsed, daily.agents.active(), life.previewing(), snoozed, snooze_expired), snoozed, daily.agents.clone())
                     };
-                    if snooze_expired { let _ = life.core().store.set_setting("snooze_until", "0"); }
-                    let (snap, locked) = life.tick(now, &today, lifecycle::Tick {
-                        defer,
-                        expire: snooze_expired,
-                        remind: !snoozed,
-                    });
-                    if locked { daily::notify("Time to move. Your next set is ready.".into()); }
+                    if tick.expire { let _ = life.core().store.set_setting("snooze_until", "0"); }
+                    let warning = if poll_due { life.workday_warning(now, reps_cli::workday::local_minute(), &today, tick.remind) } else { None };
+                    let (snap, locked) = life.tick(now, &today, tick);
+                    if poll_due {
+                        // A warning stays up for its date while the session is coding or due a set.
+                        let stale = !matches!(snap.phase, Phase::Coding | Phase::ExerciseRequired) || life.core().store.setting("last_day_warning", "") != today;
+                        if warning.is_some() || stale { control::set_notice(&handle, warning.clone()); }
+                    }
+                    match warning {
+                        Some(message) => daily::notify(message),
+                        None if locked => daily::notify("Time to move. Your next set is ready.".into()),
+                        None => {}
+                    }
                     ui::tick(&handle, &snap, now, snoozed);
-                    if (now as u64) % 5 == 0 {
-                        let status = serde_json::json!({"pid":std::process::id(),"updatedAt":now,"phase":snap.phase,"remainingSeconds":snap.remaining_seconds,"paused":snap.paused,"mode":runtime.mode,"lockMode":false});
+                    if poll_due {
+                        let status = serde_json::json!({"pid":std::process::id(),"updatedAt":now,"agents":agents,"phase":snap.phase,"remainingSeconds":snap.remaining_seconds,"paused":snap.paused,"mode":runtime.mode,"lockMode":false});
                         let home = &runtime.session_home;
                         if std::fs::write(home.join("status.json.tmp"), status.to_string()).is_ok() { let _ = std::fs::rename(home.join("status.json.tmp"), home.join("status.json")); }
                     }

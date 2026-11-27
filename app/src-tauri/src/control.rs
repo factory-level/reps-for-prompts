@@ -11,6 +11,8 @@ impl Default for DisplayState{fn default()->Self{Self{notice:None,view:"screen".
 pub type SharedDisplay=std::sync::Mutex<DisplayState>;
 #[tauri::command]
 pub fn get_display_state(app:AppHandle)->DisplayState {app.state::<SharedDisplay>().lock().unwrap().clone()}
+/// Show (Some) or clear (None) the notice; windows hear of it only on a change.
+pub fn set_notice(app:&AppHandle,notice:Option<String>){let state={let state=app.state::<SharedDisplay>();let mut s=state.lock().unwrap();if s.notice==notice{return;}s.notice=notice;s.clone()};let _=app.emit("display-state",state);}
 pub fn error(app:&AppHandle,message:String){app.state::<SharedDisplay>().lock().unwrap().last_error=Some(message);}
 /// The camera/vision path changed state: tell the windows.
 pub fn vision(app:&AppHandle,status:crate::vision_status::VisionStatus){let state={let state=app.state::<SharedDisplay>();let mut s=state.lock().unwrap();s.vision=status;s.clone()};let _=app.emit("display-state",state);}
